@@ -180,7 +180,7 @@ async fn handle_command(
             }
         }
         Command::Keys { db } => {
-            let kv = kv_store.read().await;
+            let mut kv = kv_store.write().await;
             match kv.keys(db.to_string()).await {
                 Ok(keys) => rb.ok_string_list(&keys).to_vec(),
                 Err(e) => rb.err(&e.to_string()).to_vec(),

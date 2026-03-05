@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::PathBuf};
 
-use anyhow::anyhow;
+use anyhow::{Ok, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
@@ -127,13 +127,20 @@ impl KvStore {
         KvStore { dbs }
     }
 
-    fn get_db_mut(&mut self, db: &str) -> anyhow::Result<&mut DB> {
+    async fn get_db_mut(&mut self, db: &str) -> anyhow::Result<&mut DB> {
+        if !self.dbs.contains_key(db) {
+            self.create_db(db.to_string()).await?;
+        }
+
         self.dbs
             .get_mut(db)
             .ok_or_else(|| anyhow!("invalid database: {}", db))
     }
 
-    fn get_db(&self, db: &str) -> anyhow::Result<&DB> {
+    async fn get_db(&mut self, db: &str) -> anyhow::Result<&DB> {
+        if !self.dbs.contains_key(db) {
+            self.create_db(db.to_string()).await?;
+        }
         self.dbs
             .get(db)
             .ok_or_else(|| anyhow!("invalid database: {}", db))
@@ -151,27 +158,27 @@ impl KvStore {
         } else {
             chrono::Utc::now().timestamp_millis() + ttl
         };
-        let db = self.get_db_mut(&db)?;
+        let db = self.get_db_mut(&db).await?;
         db.set(key, DBEntry { val, ttl: ttl_ts }).await
     }
 
     pub async fn get(&mut self, db: String, key: String) -> anyhow::Result<Option<DBEntry>> {
-        let db = self.get_db_mut(&db)?;
+        let db = self.get_db_mut(&db).await?;
         db.get(key).await
     }
 
     pub async fn del(&mut self, db: String, key: String) -> anyhow::Result<()> {
-        let db = self.get_db_mut(&db)?;
+        let db = self.get_db_mut(&db).await?;
         db.del(key).await
     }
 
-    pub async fn keys(&self, db: String) -> anyhow::Result<Vec<String>> {
-        let db = self.get_db(&db)?;
+    pub async fn keys(&mut self, db: String) -> anyhow::Result<Vec<String>> {
+        let db = self.get_db(&db).await?;
         Ok(db.keys())
     }
 
     pub async fn flush(&mut self, db: String) -> anyhow::Result<()> {
-        let db = self.get_db_mut(&db)?;
+        let db = self.get_db_mut(&db).await?;
         db.flush().await
     }
 
