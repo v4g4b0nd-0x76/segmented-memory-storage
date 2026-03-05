@@ -149,10 +149,49 @@ async fn handle_command(
             key,
             val,
             ttl_secs,
-        } => rb.ok_empty().to_vec(),
-        Command::GetKey { db, key } => rb.ok_empty().to_vec(),
-        Command::DelKey { db, key } => rb.ok_empty().to_vec(),
-        Command::Keys { db } => rb.ok_empty().to_vec(),
-        Command::Flush { db } => rb.ok_empty().to_vec(),
+        } => {
+            let mut kv = kv_store.write().await;
+            match kv
+                .set(
+                    db.to_string(),
+                    key.to_string(),
+                    val.to_vec(),
+                    (ttl_secs * 1000) as i64,
+                )
+                .await
+            {
+                Ok(()) => rb.ok_empty().to_vec(),
+                Err(e) => rb.err(&e.to_string()).to_vec(),
+            }
+        }
+        Command::GetKey { db, key } => {
+            let mut kv = kv_store.write().await;
+            match kv.get(db.to_string(), key.to_string()).await {
+                Ok(Some(entry)) => rb.ok_bytes(&entry.val).to_vec(),
+                Ok(None) => rb.ok_empty().to_vec(),
+                Err(e) => rb.err(&e.to_string()).to_vec(),
+            }
+        }
+        Command::DelKey { db, key } => {
+            let mut kv = kv_store.write().await;
+            match kv.del(db.to_string(), key.to_string()).await {
+                Ok(()) => rb.ok_empty().to_vec(),
+                Err(e) => rb.err(&e.to_string()).to_vec(),
+            }
+        }
+        Command::Keys { db } => {
+            let kv = kv_store.read().await;
+            match kv.keys(db.to_string()).await {
+                Ok(keys) => rb.ok_string_list(&keys).to_vec(),
+                Err(e) => rb.err(&e.to_string()).to_vec(),
+            }
+        }
+        Command::Flush { db } => {
+            let mut kv = kv_store.write().await;
+            match kv.flush(db.to_string()).await {
+                Ok(()) => rb.ok_empty().to_vec(),
+                Err(e) => rb.err(&e.to_string()).to_vec(),
+            }
+        }
     }
 }

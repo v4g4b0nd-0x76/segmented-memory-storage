@@ -1,35 +1,36 @@
-use std::{collections::HashMap, ops::Add, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf};
 
-use anyhow::{Ok, anyhow};
-use futures::task::ArcWake;
+use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use tokio::fs;
+
 const AOF_DIR: &str = "aof";
 
-// a kv store with aof
-#[derive(Serialize, Deserialize, Clone, Debug)] // here json is certainly is not cheap either in parsing neither while saving but i chose json for simplicity
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DBEntry {
     pub val: Vec<u8>,
-    pub ttl: i64, // we store the timestamp of which this entry should be expired so when replicate this db over other instances or saving in aof we know exact time that this shall be expired
-                  // 0 for ttl means this entry lives for ever
+    pub ttl: i64,
 }
+
 #[derive(Serialize, Deserialize)]
 enum Command {
-    SET(String),
-    DEL(String),
+    SET,
+    DEL,
 }
+
 #[derive(Serialize, Deserialize)]
 struct AofEntry {
     command: Command,
     key: String,
     entry: Option<DBEntry>,
 }
+
 #[derive(Clone, Debug)]
 struct DB {
     id: String,
     entries: HashMap<String, DBEntry>,
 }
+
 impl DB {
     fn new(id: String) -> Self {
         DB {
@@ -39,86 +40,105 @@ impl DB {
     }
 
     async fn set(&mut self, key: String, entry: DBEntry) -> anyhow::Result<()> {
-        // ttl in here is pre calculated in tcp server as the dto for insert is different
         self.entries.insert(key.clone(), entry.clone());
-        self.append_aof(Command::SET("SET".to_string()), key, Some(entry))
-            .await?;
+        self.append_aof(Command::SET, key, Some(entry)).await?;
         Ok(())
     }
-    async fn get(&mut self, key: String) -> anyhow::Result<Option<&DBEntry>, anyhow::Error> {
-        self.entries
-            .get(&key)
-            .map(|val| {
-                if val.ttl > chrono::Utc::now().timestamp_millis() {
-                    self.entries.to_owned().remove(&key);
-                    return None;
+
+    async fn get(&mut self, key: String) -> anyhow::Result<Option<DBEntry>> {
+        match self.entries.get(&key) {
+            None => Ok(None),
+            Some(val) => {
+                if val.ttl != 0 && val.ttl < chrono::Utc::now().timestamp_millis() {
+                    self.entries.remove(&key);
+                    self.append_aof(Command::DEL, key, None).await?;
+                    return Ok(None);
                 }
-                return Some(val);
-            })
-            .ok_or(anyhow::anyhow!("{} not found", key))
+                Ok(self.entries.get(&key).cloned())
+            }
+        }
     }
-    async fn del(&mut self, key: String) -> anyhow::Result<(), anyhow::Error> {
-        let _ = self
-            .entries
+
+    async fn del(&mut self, key: String) -> anyhow::Result<()> {
+        self.entries
             .remove(&key)
-            .ok_or(anyhow::anyhow!("{} not found", key));
-        self.append_aof(Command::DEL("DEL".to_string()), key, None)
-            .await?;
+            .ok_or_else(|| anyhow!("{} not found", key))?;
+        self.append_aof(Command::DEL, key, None).await?;
         Ok(())
     }
-    async fn keys(&self) -> anyhow::Result<Vec<&String>> {
-        let keys: Vec<&String> = self.entries.keys().collect();
-        Ok(keys)
+
+    fn keys(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
     }
-    async fn flush(&mut self) -> anyhow::Result<(), anyhow::Error> {
-        self.entries = HashMap::new();
+
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        self.entries.clear();
         self.flush_aof().await?;
         Ok(())
     }
+
     async fn append_aof(
         &self,
         cmd: Command,
         key: String,
         entry: Option<DBEntry>,
     ) -> anyhow::Result<()> {
-        // TODO: add new entries to some vec and after a certain limit flush it into the file
-        let _ = fs::create_dir_all(AOF_DIR).await;
-        let path: PathBuf = PathBuf::from(format!("{}/{}.aof", AOF_DIR, self.id));
-        let content = fs::read_to_string(&path).await?;
-        let mut entries = serde_json::from_str::<Vec<AofEntry>>(&content)?;
+        fs::create_dir_all(AOF_DIR).await?;
+        let path = PathBuf::from(format!("{}/{}.aof", AOF_DIR, self.id));
+
+        let mut entries: Vec<AofEntry> = if path.exists() {
+            let content = fs::read_to_string(&path).await?;
+            if content.trim().is_empty() {
+                vec![]
+            } else {
+                serde_json::from_str(&content)?
+            }
+        } else {
+            vec![]
+        };
+
         entries.push(AofEntry {
             command: cmd,
             key,
             entry,
         });
-        let new_content = serde_json::json!(entries);
-        fs::write(&path, new_content.to_string().as_bytes()).await?;
+        fs::write(&path, serde_json::to_vec(&entries)?).await?;
         Ok(())
     }
-    async fn flush_aof(&mut self) -> anyhow::Result<(), anyhow::Error> {
-        let _ = fs::create_dir_all(AOF_DIR).await;
+
+    async fn flush_aof(&self) -> anyhow::Result<()> {
+        fs::create_dir_all(AOF_DIR).await?;
         let path = PathBuf::from(format!("{}/{}.aof", AOF_DIR, self.id));
-        fs::write(path, []).await?;
+        fs::write(path, b"[]").await?;
         Ok(())
     }
 }
+
 pub struct KvStore {
     dbs: HashMap<String, DB>,
 }
 
 impl KvStore {
     pub async fn new() -> Self {
-        let dbs: HashMap<String, DB> = load_dbs()
-            .await
-            .map_err(|e| {
-                println!("failed to load dbs {:#?}", e);
-                let map: HashMap<String, DB> = HashMap::new();
-                return map;
-            })
-            .unwrap();
-
-        KvStore { dbs: dbs }
+        let dbs = load_dbs().await.unwrap_or_else(|e| {
+            eprintln!("failed to load dbs: {:#?}", e);
+            HashMap::new()
+        });
+        KvStore { dbs }
     }
+
+    fn get_db_mut(&mut self, db: &str) -> anyhow::Result<&mut DB> {
+        self.dbs
+            .get_mut(db)
+            .ok_or_else(|| anyhow!("invalid database: {}", db))
+    }
+
+    fn get_db(&self, db: &str) -> anyhow::Result<&DB> {
+        self.dbs
+            .get(db)
+            .ok_or_else(|| anyhow!("invalid database: {}", db))
+    }
+
     pub async fn set(
         &mut self,
         db: String,
@@ -126,101 +146,96 @@ impl KvStore {
         val: Vec<u8>,
         ttl: i64,
     ) -> anyhow::Result<()> {
-        let db = self
-            .dbs
-            .get_mut(&db)
-            .ok_or(anyhow!("invalid database"))
-            .unwrap();
-        let ttl_ts = chrono::Utc::now().timestamp_millis() + ttl;
-        db.set(
-            key,
-            DBEntry {
-                val: val,
-                ttl: ttl_ts,
-            },
-        )
-        .await?;
-        Ok(())
+        let ttl_ts = if ttl == 0 {
+            0
+        } else {
+            chrono::Utc::now().timestamp_millis() + ttl
+        };
+        let db = self.get_db_mut(&db)?;
+        db.set(key, DBEntry { val, ttl: ttl_ts }).await
     }
-    pub async fn get(
-        &mut self,
-        db: String,
-        key: String,
-    ) -> anyhow::Result<Option<&DBEntry>, anyhow::Error> {
-        let db = self.dbs.get_mut(&db);
-        if let Some(db) = db {
-            db.get(key).await?;
+
+    pub async fn get(&mut self, db: String, key: String) -> anyhow::Result<Option<DBEntry>> {
+        let db = self.get_db_mut(&db)?;
+        db.get(key).await
+    }
+
+    pub async fn del(&mut self, db: String, key: String) -> anyhow::Result<()> {
+        let db = self.get_db_mut(&db)?;
+        db.del(key).await
+    }
+
+    pub async fn keys(&self, db: String) -> anyhow::Result<Vec<String>> {
+        let db = self.get_db(&db)?;
+        Ok(db.keys())
+    }
+
+    pub async fn flush(&mut self, db: String) -> anyhow::Result<()> {
+        let db = self.get_db_mut(&db)?;
+        db.flush().await
+    }
+
+    pub async fn create_db(&mut self, id: String) -> anyhow::Result<()> {
+        if self.dbs.contains_key(&id) {
+            return Err(anyhow!("database {} already exists", id));
         }
-        return Ok(None);
-    }
-    pub async fn del(&mut self, db: String, key: String) -> anyhow::Result<(), anyhow::Error> {
-        let db = self.dbs.get_mut(&db);
-        if let Some(db) = db {
-            db.del(key).await?;
-        }
-        return Ok(());
-    }
-    pub async fn keys(&mut self, db: String) -> anyhow::Result<Vec<&String>> {
-        let db = self
-            .dbs
-            .get(&db)
-            .ok_or(anyhow!("invalid database"))
-            .unwrap();
-        let res = db.keys().await?;
-        Ok(res)
-    }
-    pub async fn flush(&mut self, db: String) -> anyhow::Result<(), anyhow::Error> {
-        let db = self
-            .dbs
-            .get_mut(&db)
-            .ok_or(anyhow!("invalid database"))
-            .unwrap();
-        db.flush().await?;
+        self.dbs.insert(id.clone(), DB::new(id));
         Ok(())
     }
 }
+
 async fn load_dbs() -> anyhow::Result<HashMap<String, DB>> {
-    let _ = fs::create_dir_all(AOF_DIR).await;
+    fs::create_dir_all(AOF_DIR).await?;
     let mut aof_dir = fs::read_dir(AOF_DIR).await?;
     let mut dbs: HashMap<String, DB> = HashMap::new();
+
     while let Some(entry) = aof_dir.next_entry().await? {
         if entry.file_type().await?.is_dir() {
             continue;
         }
-        let file_name = entry.file_name();
-        if !file_name.to_str().unwrap().contains(".aof") {
-            continue;
-        };
 
-        let parts: Vec<&str> = file_name.to_str().unwrap().split(".aof").collect();
-        let db_num = parts[0];
-        let mut db = DB::new(db_num.to_string());
+        let file_name = entry.file_name();
+        let file_str = file_name.to_string_lossy();
+
+        if !file_str.ends_with(".aof") {
+            continue;
+        }
+
+        let db_id = file_str.trim_end_matches(".aof").to_string();
+        let mut db = DB::new(db_id.clone());
+
+        let aof = fs::read_to_string(entry.path()).await?;
+        if aof.trim().is_empty() {
+            dbs.insert(db_id, db);
+            continue;
+        }
+
+        let entries: Vec<AofEntry> = serde_json::from_str(&aof)?;
+
         let mut insert_commands: HashMap<String, DBEntry> = HashMap::new();
-        let mut del_keys: Vec<String> = Vec::new();
-        // at end we just apply the insert commands after remove keys in del_commands from it
-        let aof = fs::read_to_string(PathBuf::from(format!(
-            "aof/{}",
-            file_name.to_string_lossy()
-        )))
-        .await?;
-        let entries = serde_json::from_str::<Vec<AofEntry>>(&aof)?;
+        let mut del_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         for entry in entries {
             match entry.command {
-                Command::SET(_) => {
+                Command::SET => {
                     if let Some(db_entry) = entry.entry {
-                        let e = db_entry.clone();
-                        insert_commands.insert(entry.key, e);
+                        insert_commands.insert(entry.key, db_entry);
                     }
                 }
-                Command::DEL(_) => del_keys.push(entry.key),
+                Command::DEL => {
+                    del_keys.insert(entry.key);
+                }
             }
         }
+
         for (k, v) in insert_commands {
             if !del_keys.contains(&k) {
-                db.set(k, v).await?;
+                db.entries.insert(k, v);
             }
         }
-        dbs.insert(db_num.to_string(), db);
+
+        dbs.insert(db_id, db);
     }
+
     Ok(dbs)
 }

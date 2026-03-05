@@ -306,6 +306,30 @@ impl ResponseBuilder {
         self.finalize()
     }
 
+    pub fn ok_bytes(&mut self, val: &[u8]) -> &[u8] {
+        self.buf.clear();
+        self.buf.extend_from_slice(&[0u8; 4]);
+        self.buf.push(STATUS_OK);
+        self.buf
+            .extend_from_slice(&(val.len() as u32).to_le_bytes());
+        self.buf.extend_from_slice(val);
+        self.finalize()
+    }
+
+    pub fn ok_string_list(&mut self, keys: &[String]) -> &[u8] {
+        self.buf.clear();
+        self.buf.extend_from_slice(&[0u8; 4]);
+        self.buf.push(STATUS_OK);
+        self.buf
+            .extend_from_slice(&(keys.len() as u32).to_le_bytes());
+        for key in keys {
+            self.buf
+                .extend_from_slice(&(key.len() as u16).to_le_bytes());
+            self.buf.extend_from_slice(key.as_bytes());
+        }
+        self.finalize()
+    }
+
     pub fn err(&mut self, msg: &str) -> &[u8] {
         self.buf.clear();
         self.buf.extend_from_slice(&[0u8; 4]);
