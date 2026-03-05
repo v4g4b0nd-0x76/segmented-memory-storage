@@ -8,7 +8,6 @@ use axum::{
 };
 use base64::Engine;
 
-
 use serde_json::json;
 
 use crate::client::pool::ClientPool;
@@ -301,6 +300,152 @@ pub async fn drop_entries(
             Json(json!({"status": format!("entries dropped up to id {}", upto_id)})),
         )
             .into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn kv_set(
+    State(pool): State<Arc<ClientPool>>,
+    Path((db, key)): Path<(String, String)>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let ttl_secs = req.get("ttl").and_then(|v| v.as_u64()).unwrap_or(0);
+    let val = match req.get("val") {
+        Some(v) => serde_json::to_vec(v).unwrap(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing val"})),
+            )
+                .into_response();
+        }
+    };
+    match conn.conn().kv_set(&db, &key, &val, ttl_secs).await {
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({"status": "ok"}))).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn kv_get(
+    State(pool): State<Arc<ClientPool>>,
+    Path((db, key)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    match conn.conn().kv_get(&db, &key).await {
+        Ok(Ok(Some(bytes))) => {
+            let val: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (StatusCode::OK, Json(json!({"val": val}))).into_response()
+        }
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "key not found"})),
+        )
+            .into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn kv_del(
+    State(pool): State<Arc<ClientPool>>,
+    Path((db, key)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    match conn.conn().kv_del(&db, &key).await {
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({"status": "deleted"}))).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn kv_keys(
+    State(pool): State<Arc<ClientPool>>,
+    Path(db): Path<String>,
+) -> impl IntoResponse {
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    match conn.conn().kv_keys(&db).await {
+        Ok(Ok(keys)) => (StatusCode::OK, Json(json!({"keys": keys}))).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn kv_flush(
+    State(pool): State<Arc<ClientPool>>,
+    Path(db): Path<String>,
+) -> impl IntoResponse {
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    match conn.conn().kv_flush(&db).await {
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({"status": "flushed"}))).into_response(),
         Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

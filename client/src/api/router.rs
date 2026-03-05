@@ -10,7 +10,7 @@ use crate::{api::handlers::*, client::pool::ClientPool};
 
 pub fn build_router(pool: Arc<ClientPool>) -> Router {
     let health_route = Router::new().route("/health", get(health));
-    let api_router = Router::new()
+    let router = Router::new()
         .route("/groups", get(list_groups))
         .route("/groups/{name}", post(create_group))
         .route("/groups/{name}", delete(drop_group))
@@ -26,9 +26,12 @@ pub fn build_router(pool: Arc<ClientPool>) -> Router {
             "/groups/{name}/entries/trim/{upto_id}",
             delete(drop_entries),
         )
+        .route("/kv/:db/:key", post(kv_set).get(kv_get).delete(kv_del))
+        .route("/kv/:db/keys", get(kv_keys))
+        .route("/kv/:db/flush", post(kv_flush))
         .with_state(pool);
 
-    Router::new().merge(health_route).merge(api_router).layer(
+    Router::new().merge(health_route).merge(router).layer(
         CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)

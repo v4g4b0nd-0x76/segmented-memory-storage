@@ -213,6 +213,92 @@ impl StreamClient {
             Ok(Err(Self::extract_err(&resp)))
         }
     }
+    fn build_cmd_with_db_key(tag: u8, db: &str, key: &str) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 2 + db.len() + 2 + key.len());
+        buf.push(tag);
+        buf.extend_from_slice(&(db.len() as u16).to_le_bytes());
+        buf.extend_from_slice(db.as_bytes());
+        buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        buf.extend_from_slice(key.as_bytes());
+        buf
+    }
+
+    pub async fn kv_set(
+        &mut self,
+        db: &str,
+        key: &str,
+        val: &[u8],
+        ttl_secs: u64,
+    ) -> anyhow::Result<Result<(), String>> {
+        let mut frame = Vec::with_capacity(1 + 2 + db.len() + 2 + key.len() + 8 + 4 + val.len());
+        frame.push(0x10);
+        frame.extend_from_slice(&(db.len() as u16).to_le_bytes());
+        frame.extend_from_slice(db.as_bytes());
+        frame.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        frame.extend_from_slice(key.as_bytes());
+        frame.extend_from_slice(&ttl_secs.to_le_bytes());
+        frame.extend_from_slice(&(val.len() as u32).to_le_bytes());
+        frame.extend_from_slice(val);
+        let resp = self.send_recv(&frame).await?;
+        Ok(Self::check_status(&resp))
+    }
+
+    pub async fn kv_get(
+        &mut self,
+        db: &str,
+        key: &str,
+    ) -> anyhow::Result<Result<Option<Vec<u8>>, String>> {
+        let frame = Self::build_cmd_with_db_key(0x11, db, key);
+        let resp = self.send_recv(&frame).await?;
+        if resp[0] != 0x00 {
+            return Ok(Err(Self::extract_err(&resp)));
+        }
+        if resp.len() < 5 {
+            return Ok(Ok(None));
+        }
+        let val_len = u32::from_le_bytes(resp[1..5].try_into().unwrap()) as usize;
+        if val_len == 0 {
+            return Ok(Ok(None));
+        }
+        Ok(Ok(Some(resp[5..5 + val_len].to_vec())))
+    }
+
+    pub async fn kv_del(&mut self, db: &str, key: &str) -> anyhow::Result<Result<(), String>> {
+        let frame = Self::build_cmd_with_db_key(0x12, db, key);
+        let resp = self.send_recv(&frame).await?;
+        Ok(Self::check_status(&resp))
+    }
+
+    pub async fn kv_keys(&mut self, db: &str) -> anyhow::Result<Result<Vec<String>, String>> {
+        let mut frame = Vec::with_capacity(1 + 2 + db.len());
+        frame.push(0x13);
+        frame.extend_from_slice(&(db.len() as u16).to_le_bytes());
+        frame.extend_from_slice(db.as_bytes());
+        let resp = self.send_recv(&frame).await?;
+        if resp[0] != 0x00 {
+            return Ok(Err(Self::extract_err(&resp)));
+        }
+        let count = u32::from_le_bytes(resp[1..5].try_into().unwrap()) as usize;
+        let mut keys = Vec::with_capacity(count);
+        let mut pos = 5;
+        for _ in 0..count {
+            let key_len = u16::from_le_bytes(resp[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            let key = String::from_utf8_lossy(&resp[pos..pos + key_len]).to_string();
+            pos += key_len;
+            keys.push(key);
+        }
+        Ok(Ok(keys))
+    }
+
+    pub async fn kv_flush(&mut self, db: &str) -> anyhow::Result<Result<(), String>> {
+        let mut frame = Vec::with_capacity(1 + 2 + db.len());
+        frame.push(0x14);
+        frame.extend_from_slice(&(db.len() as u16).to_le_bytes());
+        frame.extend_from_slice(db.as_bytes());
+        let resp = self.send_recv(&frame).await?;
+        Ok(Self::check_status(&resp))
+    }
 
     fn check_status(resp: &[u8]) -> Result<(), String> {
         if resp.is_empty() {
