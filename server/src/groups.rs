@@ -1,6 +1,6 @@
 use futures::TryFutureExt;
 use tokio::fs::File;
-
+// Like redis list you can put entries in groups and each group assign entries for it self
 use crate::{
     lru::{LRU, build_key},
     seg_log::{LogEntry, LogError, SegLog},

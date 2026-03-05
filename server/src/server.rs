@@ -1,5 +1,6 @@
 use crate::codec::LengthPrefixCodec;
 use crate::groups::{GroupError, GroupManager, GroupStats};
+use crate::kv::KvStore;
 use crate::proto::{self, Command, ParseError, ResponseBuilder};
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -7,13 +8,16 @@ use tokio::{net::TcpListener, sync::RwLock};
 use tokio_util::codec::Framed;
 pub struct Server {
     group_manager: Arc<RwLock<GroupManager>>,
+    kv_store: Arc<RwLock<KvStore>>,
 }
 
 impl Server {
     pub async fn new() -> Self {
         let manager = Arc::new(RwLock::new(GroupManager::new().await));
+        let kv_store = Arc::new(RwLock::new(KvStore::new().await));
         Server {
             group_manager: manager,
+            kv_store: kv_store,
         }
     }
     pub async fn start(&self, addr: &str) -> anyhow::Result<()> {
@@ -22,7 +26,9 @@ impl Server {
             let (socket, peer) = ln.accept().await?;
             println!("New connection from {}", peer);
             socket.set_nodelay(true)?;
+            // TODO: make handle command a implementation of server so we dont pass the group wrapper and kv store around for each command
             let manager = Arc::clone(&self.group_manager);
+            let kv_store = Arc::clone(&self.kv_store);
             tokio::spawn(async move {
                 let mut framed = Framed::new(socket, LengthPrefixCodec);
                 let mut resp_builder = ResponseBuilder::new();
@@ -36,7 +42,7 @@ impl Server {
                     };
                     let resp = match proto::parse_command(&frame) {
                         Result::<_, ParseError>::Ok(cmd) => {
-                            handle_command(&manager, cmd, &mut resp_builder).await
+                            handle_command(&manager, &kv_store, cmd, &mut resp_builder).await
                         }
                         Result::<_, ParseError>::Err(e) => {
                             let msg = format!("parse error: {}", e.0);
@@ -56,6 +62,7 @@ impl Server {
 
 async fn handle_command(
     manager: &Arc<RwLock<GroupManager>>,
+    kv_store: &Arc<RwLock<KvStore>>,
     cmd: Command<'_>,
     rb: &mut ResponseBuilder,
 ) -> Vec<u8> {
@@ -137,5 +144,15 @@ async fn handle_command(
                 Result::<GroupStats, GroupError>::Err(e) => rb.err(&e.to_string()).to_vec(),
             }
         }
+        Command::SetKey {
+            db,
+            key,
+            val,
+            ttl_secs,
+        } => rb.ok_empty().to_vec(),
+        Command::GetKey { db, key } => rb.ok_empty().to_vec(),
+        Command::DelKey { db, key } => rb.ok_empty().to_vec(),
+        Command::Keys { db } => rb.ok_empty().to_vec(),
+        Command::Flush { db } => rb.ok_empty().to_vec(),
     }
 }

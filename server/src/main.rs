@@ -2,6 +2,7 @@ use crate::server::Server;
 
 mod codec;
 mod groups;
+mod kv;
 mod lru;
 mod proto;
 mod seg_log;

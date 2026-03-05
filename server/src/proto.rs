@@ -7,6 +7,11 @@ pub const CMD_READ_RANGE: u8 = 0x06;
 pub const CMD_REMOVE: u8 = 0x07;
 pub const CMD_LIST_GROUPS: u8 = 0x08;
 pub const CMD_GROUP_STATS: u8 = 0x09;
+pub const CMD_SET: u8 = 0x10;
+pub const CMD_GET: u8 = 0x11;
+pub const CMD_DEL: u8 = 0x12;
+pub const CMD_KEYS: u8 = 0x13;
+pub const CMD_FLUSH: u8 = 0x14;
 
 pub const STATUS_OK: u8 = 0x00;
 pub const STATUS_ERR: u8 = 0x01;
@@ -44,6 +49,26 @@ pub enum Command<'a> {
     ListGroups,
     GroupStats {
         group: &'a str,
+    },
+    SetKey {
+        db: &'a str,
+        key: &'a str,
+        val: &'a [u8],
+        ttl_secs: u64,
+    },
+    GetKey {
+        db: &'a str,
+        key: &'a str,
+    },
+    DelKey {
+        db: &'a str,
+        key: &'a str,
+    },
+    Keys {
+        db: &'a str,
+    },
+    Flush {
+        db: &'a str,
     },
 }
 
@@ -203,7 +228,6 @@ impl ResponseBuilder {
             buf: Vec::with_capacity(4096),
         }
     }
-
 
     pub fn ok_empty(&mut self) -> &[u8] {
         self.buf.clear();
