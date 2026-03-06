@@ -15,6 +15,11 @@ Snapshot segments when a reallocation/new segment applies. and load snapshot for
 
 LRU in group wrapper level for better performance and less segment access.
 
+Key Value (KV) storage with ttl option and different database isolated access like redis.
+KV has aof using an AOF channel for asynchronous and faster aof write witch runs in different thread for each db.
+
+Seg List which is like redis stack to push, push_range, pop, pop_count, pop_range and flush features
+
 ## Client
 
 Custom connection pool for connections to server using its own protocol
