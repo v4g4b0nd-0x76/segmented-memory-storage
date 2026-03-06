@@ -1,11 +1,11 @@
 use futures::TryFutureExt;
-use tokio::fs::File;
+use tokio::{fs::File, sync::Mutex};
 // Like redis list you can put entries in groups and each group assign entries for it self
 use crate::{
     lru::{LRU, build_key},
     seg_log::{LogEntry, LogError, SegLog},
 };
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 #[derive(Debug)]
 pub enum GroupError {
     GroupNotFound(String),
@@ -34,12 +34,11 @@ pub struct GroupStats {
 
 struct Group {
     name: String,
-    log: SegLog,
+    log: Arc<Mutex<SegLog>>,
     lru_cache: LRU<u64, LogEntry>,
 }
 impl Group {
     fn add_cache(&mut self, id: u64, timestamp: u64, payload: &[u8]) {
-        // TODO: make it group implementation
         let entry = LogEntry {
             id: id,
             timestamp: timestamp,
@@ -68,7 +67,8 @@ impl GroupManager {
         if self.groups.contains_key(name) {
             return Err(GroupError::GroupAlreadyExists(name.to_string()));
         }
-        let log = SegLog::new(name.to_string());
+        let log = Arc::new(Mutex::new(SegLog::new(name.to_string())));
+        SegLog::start_periodic_snapshot(Arc::clone(&log), Duration::from_secs(60));
         let group = Group {
             name: name.to_string(),
             log,
@@ -78,6 +78,7 @@ impl GroupManager {
         self.snapshot_group(name)
             .await
             .expect(&format!("failed to snapshot group '{}'", name));
+
         Ok(())
     }
     pub async fn drop_group(&mut self, name: &str) -> Result<(), GroupError> {
@@ -99,7 +100,7 @@ impl GroupManager {
             .groups
             .get_mut(group)
             .ok_or_else(|| GroupError::GroupNotFound(group.to_owned()))?;
-        let id = grp.log.append(timestamp, payload).await?;
+        let id = grp.log.lock().await.append(timestamp, payload).await?;
         grp.add_cache(id, timestamp, payload);
         Ok(id)
     }
@@ -118,17 +119,22 @@ impl GroupManager {
             return Err(GroupError::LogError(LogError::EntryNotFound));
         }
 
-        let first_id = grp.log.append(entries[0].0, entries[0].1).await?;
+        let first_id = grp
+            .log
+            .lock()
+            .await
+            .append(entries[0].0, entries[0].1)
+            .await?;
         grp.add_cache(first_id, entries[0].0, entries[0].1);
         let mut last_id = first_id;
         for &(ts, payload) in &entries[1..] {
-            let id = grp.log.append(ts, payload).await?;
+            let id = grp.log.lock().await.append(ts, payload).await?;
             grp.add_cache(id, ts, payload);
             last_id = id;
         }
         Ok((first_id, last_id))
     }
-    pub fn read(&mut self, group: &str, id: u64) -> Result<(u64, u64, Vec<u8>), GroupError> {
+    pub async fn read(&mut self, group: &str, id: u64) -> Result<(u64, u64, Vec<u8>), GroupError> {
         let grp = self
             .groups
             .get_mut(group)
@@ -136,10 +142,10 @@ impl GroupManager {
         if let Some(cached) = grp.lru_cache.get(&build_key(group, id)) {
             return Ok((cached.id, cached.timestamp, cached.payload.clone()));
         }
-        Ok(grp.log.read(id)?)
+        Ok(grp.log.lock().await.read(id)?)
     }
 
-    pub fn read_range(
+    pub async fn read_range(
         &mut self,
         group: &str,
         start: u64,
@@ -164,16 +170,16 @@ impl GroupManager {
         if all_cached && cached.len() as u64 == range {
             return Ok(cached);
         } else {
-            Ok(grp.log.read_range(start, end))
+            Ok(grp.log.lock().await.read_range(start, end))
         }
     }
 
-    pub fn remove(&mut self, group: &str, up_to_id: u64) -> Result<(), GroupError> {
+    pub async fn remove(&mut self, group: &str, up_to_id: u64) -> Result<(), GroupError> {
         let grp = self
             .groups
             .get_mut(group)
             .ok_or_else(|| GroupError::GroupNotFound(group.to_owned()))?;
-        let to_remove = grp.log.trim(up_to_id);
+        let to_remove = grp.log.lock().await.trim(up_to_id);
         for id in &to_remove {
             grp.lru_cache.remove(&build_key(group, *id));
         }
@@ -184,15 +190,15 @@ impl GroupManager {
         self.groups.keys().map(|s| s.as_str()).collect()
     }
 
-    pub fn group_stats(&self, group: &str) -> Result<GroupStats, GroupError> {
+    pub async fn group_stats(&self, group: &str) -> Result<GroupStats, GroupError> {
         let grp = self
             .groups
             .get(group)
             .ok_or_else(|| GroupError::GroupNotFound(group.to_owned()))?;
         Ok(GroupStats {
-            total_entries: grp.log.total_entries(),
-            total_segments: grp.log.total_segments(),
-            next_id: grp.log.next_id(),
+            total_entries: grp.log.lock().await.total_entries(),
+            total_segments: grp.log.lock().await.total_segments(),
+            next_id: grp.log.lock().await.next_id(),
         })
     }
     async fn snapshot_group(&self, group: &str) -> anyhow::Result<()> {
@@ -267,6 +273,8 @@ impl GroupManager {
             })?;
             group
                 .log
+                .lock()
+                .await
                 .load_snapshot()
                 .map_err(|e| anyhow::anyhow!("failed to load snapshot for group '{}': {}", grp, e))
                 .await?;
@@ -295,14 +303,14 @@ mod tests {
         assert_eq!(a2, 2);
         assert_eq!(a3, 3);
 
-        let (rid, rts, rdata) = m.read("g1", a2).unwrap();
+        let (rid, rts, rdata) = m.read("g1", a2).await.unwrap();
         assert_eq!(rid, 2);
         assert_eq!(rts, 200);
         assert_eq!(rdata, b"bbb");
 
-        assert!(m.read("g1", 999).is_err());
+        assert!(m.read("g1", 999).await.is_err());
         assert!(m.add("ghost", 0, b"x").await.is_err());
-        assert!(m.read("ghost", 1).is_err());
+        assert!(m.read("ghost", 1).await.is_err());
 
         let (first, last) = m
             .add_range("g1", &[(400, b"ddd"), (500, b"eee"), (600, b"fff")])
@@ -311,29 +319,29 @@ mod tests {
         assert_eq!(first, 4);
         assert_eq!(last, 6);
 
-        let range = m.read_range("g1", 2, 5).unwrap();
+        let range = m.read_range("g1", 2, 5).await.unwrap();
         assert_eq!(range.len(), 4);
         assert_eq!(range[0].0, 2);
         assert_eq!(range[3].0, 5);
 
-        assert!(m.read_range("g1", 900, 999).unwrap().is_empty());
+        assert!(m.read_range("g1", 900, 999).await.unwrap().is_empty());
 
         let b1 = m.add("g2", 10, b"isolated").await.unwrap();
         assert_eq!(b1, 1);
-        let (_, _, d) = m.read("g2", 1).unwrap();
+        let (_, _, d) = m.read("g2", 1).await.unwrap();
         assert_eq!(d, b"isolated");
 
-        m.remove("g1", 4).unwrap();
-        assert!(m.read("g1", 1).is_err());
-        assert!(m.read("g1", 2).is_err());
-        assert!(m.read("g1", 3).is_err());
-        assert!(m.read("g1", 4).is_ok());
-        assert!(m.read("g1", 6).is_ok());
+        m.remove("g1", 4).await.unwrap();
+        assert!(m.read("g1", 1).await.is_err());
+        assert!(m.read("g1", 2).await.is_err());
+        assert!(m.read("g1", 3).await.is_err());
+        assert!(m.read("g1", 4).await.is_ok());
+        assert!(m.read("g1", 6).await.is_ok());
 
-        let (_, _, kept) = m.read("g2", 1).unwrap();
+        let (_, _, kept) = m.read("g2", 1).await.unwrap();
         assert_eq!(kept, b"isolated");
 
-        let stats = m.group_stats("g1").unwrap();
+        let stats = m.group_stats("g1").await.unwrap();
         assert_eq!(stats.total_entries, 3);
         assert_eq!(stats.next_id, 7);
 
@@ -343,12 +351,12 @@ mod tests {
 
         m.drop_group("g2").await.unwrap();
         assert!(m.drop_group("g2").await.is_err());
-        assert!(m.read("g2", 1).is_err());
+        assert!(m.read("g2", 1).await.is_err());
         assert_eq!(m.list_groups().len(), 1);
 
         let post = m.add("g1", 700, b"after-trim").await.unwrap();
         assert_eq!(post, 7);
-        let (_, _, pd) = m.read("g1", 7).unwrap();
+        let (_, _, pd) = m.read("g1", 7).await.unwrap();
         assert_eq!(pd, b"after-trim");
     }
 }

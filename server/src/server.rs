@@ -95,21 +95,21 @@ impl Server {
             }
             Command::Read { group, id } => {
                 let mut mgr = self.group_manager.write().await;
-                match mgr.read(group, id) {
+                match mgr.read(group, id).await {
                     Ok((entry_id, ts, payload)) => rb.ok_entry(entry_id, ts, &payload).to_vec(),
                     Err(e) => rb.err(&e.to_string()).to_vec(),
                 }
             }
             Command::ReadRange { group, start, end } => {
                 let mut mgr = self.group_manager.write().await;
-                match mgr.read_range(group, start, end) {
+                match mgr.read_range(group, start, end).await {
                     Ok(entries) => rb.ok_entries(&entries).to_vec(),
                     Err(e) => rb.err(&e.to_string()).to_vec(),
                 }
             }
             Command::Remove { group, up_to_id } => {
                 let mut mgr = self.group_manager.write().await;
-                match mgr.remove(group, up_to_id) {
+                match mgr.remove(group, up_to_id).await {
                     Ok(()) => rb.ok_empty().to_vec(),
                     Err(e) => rb.err(&e.to_string()).to_vec(),
                 }
@@ -120,7 +120,7 @@ impl Server {
             }
             Command::GroupStats { group } => {
                 let mgr = self.group_manager.read().await;
-                match mgr.group_stats(group) {
+                match mgr.group_stats(group).await {
                     Ok(stats) => rb
                         .ok_stats(stats.total_entries, stats.total_segments, stats.next_id)
                         .to_vec(),

@@ -8,7 +8,7 @@ use tokio::{
     sync::mpsc::{self, UnboundedSender},
 };
 
-use crate::lru::{self, LRU};
+use crate::lru::LRU;
 
 const AOF_DIR: &str = "aof";
 

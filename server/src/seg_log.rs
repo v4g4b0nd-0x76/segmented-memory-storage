@@ -3,28 +3,31 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     ptr,
+    sync::Arc,
+    time::Duration,
 };
 
 use serde_json::json;
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
-    sync::mpsc,
+    sync::{Mutex, mpsc},
 };
 
-const SEGMENT_SIZE: usize = 64 * 1024; // 64KB per segment for better cpu cache
-const SEGMENT_ALIGN: usize = 4096; // 4Kb for align to os page boundary and better direct mem access
-const INITIAL_SEGMENTS: usize = 8; // pre allocate 8 segments 
-const MAX_SEGMENTS: usize = 1024 * 1024 * 1024; // 1 GB
+const SEGMENT_SIZE: usize = 64 * 1024;
+const SEGMENT_ALIGN: usize = 4096;
+const INITIAL_SEGMENTS: usize = 8;
+const MAX_SEGMENTS: usize = 1024 * 1024 * 1024;
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy)]
 struct EntryLoc {
-    segment_idx: usize, // segment index in pointer vector
-    offset: usize,      // offset in segment
-    len: usize,         // total occupied bytes in this entry
+    segment_idx: usize,
+    offset: usize,
+    len: usize,
 }
 
-const HEADER_SIZE: usize = 8 + 8 + 4; // 20 bytes fixed header
+const HEADER_SIZE: usize = 8 + 8 + 4;
 
 enum SnapshotMsg {
     Take {
@@ -53,10 +56,10 @@ unsafe impl Sync for SegLog {}
 
 #[derive(bitcode::Encode, bitcode::Decode, PartialEq, Debug)]
 pub struct LogEntry {
-    pub id: u64,          // 8 bytes
-    pub timestamp: u64,   // 8 bytes
-    pub len: usize,       // 4 bytes
-    pub payload: Vec<u8>, // variable length
+    pub id: u64,
+    pub timestamp: u64,
+    pub len: usize,
+    pub payload: Vec<u8>,
 }
 
 impl SegLog {
@@ -92,7 +95,6 @@ impl SegLog {
                         })
                         .await
                         .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {e}")));
-
                         let _ = ack.send(result);
                     }
                 }
@@ -113,9 +115,20 @@ impl SegLog {
         }
     }
 
-    pub async fn snapshot(&self) -> anyhow::Result<()> {
-        let entries: Vec<LogEntry> = self
-            .idx
+    pub fn start_periodic_snapshot(log: Arc<Mutex<SegLog>>, interval: Duration) {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let guard = log.lock().await;
+                let _ = guard.fire_snapshot();
+            }
+        });
+    }
+
+    fn collect_entries(&self) -> Vec<LogEntry> {
+        self.idx
             .keys()
             .filter_map(|&id| {
                 self.read(id).ok().map(|(_, ts, payload)| LogEntry {
@@ -125,11 +138,29 @@ impl SegLog {
                     payload,
                 })
             })
-            .collect();
+            .collect()
+    }
 
+    fn fire_snapshot(&self) -> anyhow::Result<()> {
+        let entries = self.collect_entries();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let total_segments = self.segs.len();
+        let (ack_tx, _) = tokio::sync::oneshot::channel();
+        self.snapshot_tx
+            .send(SnapshotMsg::Take {
+                entries,
+                total_segments,
+                ack: ack_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("snapshot worker is gone"))
+    }
+
+    pub async fn snapshot(&self) -> anyhow::Result<()> {
+        let entries = self.collect_entries();
         let total_segments = self.segs.len();
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-
         self.snapshot_tx
             .send(SnapshotMsg::Take {
                 entries,
@@ -137,13 +168,13 @@ impl SegLog {
                 ack: ack_tx,
             })
             .map_err(|_| anyhow::anyhow!("snapshot worker is gone"))?;
-
         ack_rx.await?
     }
 
     pub async fn shutdown(&self) {
         let _ = self.snapshot_tx.send(SnapshotMsg::Shutdown);
     }
+
     pub async fn allocate_seg(&mut self) -> Result<(), LogError> {
         if self.segs.len() >= MAX_SEGMENTS {
             return Err(LogError::MaxSegmentsReached);
@@ -153,27 +184,6 @@ impl SegLog {
             return Err(LogError::AllocationFailed);
         }
         self.segs.push(ptr);
-
-        let entries: Vec<LogEntry> = self
-            .idx
-            .keys()
-            .filter_map(|&id| {
-                self.read(id).ok().map(|(_, ts, payload)| LogEntry {
-                    id,
-                    timestamp: ts,
-                    len: payload.len(),
-                    payload,
-                })
-            })
-            .collect();
-
-        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
-        let _ = self.snapshot_tx.send(SnapshotMsg::Take {
-            entries,
-            total_segments: self.segs.len(),
-            ack: ack_tx,
-        });
-
         Ok(())
     }
 
@@ -434,135 +444,158 @@ impl Drop for SegLog {
     }
 }
 
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum LogError {
+    EntryTooLarge,
+    SegmentLimitReached,
+    EntryNotFound,
+    AllocationFailed,
+    MaxSegmentsReached,
+    WriteLockUnavailable,
+    SnapshotFailed(String),
+}
+
+impl std::fmt::Display for LogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogError::EntryTooLarge => write!(f, "entry exceeds segment capacity"),
+            LogError::SegmentLimitReached => write!(f, "max segment count reached"),
+            LogError::EntryNotFound => write!(f, "entry not found"),
+            LogError::AllocationFailed => write!(f, "failed to allocate memory for segment"),
+            LogError::MaxSegmentsReached => write!(f, "maximum segments reached"),
+            LogError::WriteLockUnavailable => {
+                write!(f, "write lock is currently held by another operation")
+            }
+            LogError::SnapshotFailed(reason) => write!(f, "snapshot failed: {}", reason),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
     async fn test_full_lifecycle() {
-        let mut log = SegLog::new("test_group".to_string());
+        let log = Arc::new(Mutex::new(SegLog::new("test_group".to_string())));
+        SegLog::start_periodic_snapshot(Arc::clone(&log), Duration::from_secs(60));
 
         let entry_count = 1000u64;
-        for i in 0..entry_count {
-            let ts = 1700000000000 + i * 50;
-            let payload = format!(
-                "sensor:temp-{} value:{}.{} unit:c",
-                i % 10,
-                20 + (i % 15),
-                i % 100
-            );
-            log.append(ts, payload.as_bytes()).await.unwrap();
+        {
+            let mut g = log.lock().await;
+            for i in 0..entry_count {
+                let ts = 1700000000000 + i * 50;
+                let payload = format!(
+                    "sensor:temp-{} value:{}.{} unit:c",
+                    i % 10,
+                    20 + (i % 15),
+                    i % 100
+                );
+                g.append(ts, payload.as_bytes()).await.unwrap();
+            }
+            assert_eq!(g.total_entries(), entry_count);
+
+            let samples = [1u64, 50, 250, 500, 750, 999, 1000];
+            for &id in &samples {
+                let (read_id, read_ts, data) = g.read(id).unwrap();
+                assert_eq!(read_id, id);
+                let i = id - 1;
+                assert_eq!(read_ts, 1700000000000 + i * 50);
+                let expected = format!(
+                    "sensor:temp-{} value:{}.{} unit:c",
+                    i % 10,
+                    20 + (i % 15),
+                    i % 100
+                );
+                assert_eq!(data, expected.as_bytes());
+            }
+
+            let range = g.read_range(100, 109);
+            assert_eq!(range.len(), 10);
+            for (idx, (id, _, _)) in range.iter().enumerate() {
+                assert_eq!(*id, 100 + idx as u64);
+            }
+
+            g.trim(501);
+            assert_eq!(g.total_entries(), 500);
+            assert!(g.read(1).is_err());
+            assert!(g.read(500).is_err());
+            assert!(g.read(501).is_ok());
+
+            let new_id = g.append(9999999999999, b"post-trim-event").await.unwrap();
+            assert_eq!(new_id, entry_count + 1);
+            let (_, _, data) = g.read(new_id).unwrap();
+            assert_eq!(data, b"post-trim-event");
+
+            g.snapshot().await.expect("snapshot save failed");
         }
-        assert_eq!(log.total_entries(), entry_count);
 
-        let samples = [1u64, 50, 250, 500, 750, 999, 1000];
-        for &id in &samples {
-            let (read_id, read_ts, data) = log.read(id).unwrap();
-            assert_eq!(read_id, id);
-            let i = id - 1;
-            assert_eq!(read_ts, 1700000000000 + i * 50);
-            let expected = format!(
-                "sensor:temp-{} value:{}.{} unit:c",
-                i % 10,
-                20 + (i % 15),
-                i % 100
-            );
-            assert_eq!(data, expected.as_bytes(), "payload mismatch at id={}", id);
-        }
-
-        let range = log.read_range(100, 109);
-        assert_eq!(range.len(), 10);
-        for (idx, (id, _, _)) in range.iter().enumerate() {
-            assert_eq!(*id, 100 + idx as u64);
-        }
-
-        log.trim(501);
-        assert_eq!(log.total_entries(), 500);
-        assert!(log.read(1).is_err(), "trimmed entry must be gone");
-        assert!(log.read(500).is_err(), "trimmed entry must be gone");
-        assert!(
-            log.read(501).is_ok(),
-            "entry at cutoff boundary must survive"
-        );
-
-        let new_id = log.append(9999999999999, b"post-trim-event").await.unwrap();
-        assert_eq!(
-            new_id,
-            entry_count + 1,
-            "ID counter must continue, not reset after trim"
-        );
-        let (_, _, data) = log.read(new_id).unwrap();
-        assert_eq!(data, b"post-trim-event");
-
-        // --- Snapshot save/load test ---
-        // Save snapshot
-        log.snapshot().await.expect("snapshot save failed");
-
-        // Create a new log and load snapshot
         let mut loaded_log = SegLog::new("test_group".to_string());
         loaded_log
             .load_snapshot()
             .await
-            .map_err(|e| eprintln!("snapshot load failed: {}", e))
             .expect("snapshot load failed");
 
-        // Check that loaded log has the same number of entries
-        assert_eq!(loaded_log.total_entries(), log.total_entries());
+        let g = log.lock().await;
+        assert_eq!(loaded_log.total_entries(), g.total_entries());
 
-        // Check a few entries for correctness
-        for &id in &[501u64, 600, 750, new_id] {
-            let (orig_id, orig_ts, orig_data) = log.read(id).unwrap();
+        for &id in &[501u64, 600, 750, entry_count + 1] {
+            let (orig_id, orig_ts, orig_data) = g.read(id).unwrap();
             let (loaded_id, loaded_ts, loaded_data) = loaded_log.read(id).unwrap();
-            assert_eq!(orig_id, loaded_id, "id mismatch after snapshot load");
-            assert_eq!(orig_ts, loaded_ts, "timestamp mismatch after snapshot load");
-            assert_eq!(
-                orig_data, loaded_data,
-                "payload mismatch after snapshot load"
-            );
+            assert_eq!(orig_id, loaded_id);
+            assert_eq!(orig_ts, loaded_ts);
+            assert_eq!(orig_data, loaded_data);
         }
 
-        // Check that trimmed entries are still gone after load
         assert!(loaded_log.read(1).is_err());
         assert!(loaded_log.read(500).is_err());
-        assert!(loaded_log.read(100).is_err());
         assert!(loaded_log.read(501).is_ok());
-        assert!(loaded_log.read(new_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_periodic_snapshot_fires() {
+        let log = Arc::new(Mutex::new(SegLog::new("test_periodic".to_string())));
+        SegLog::start_periodic_snapshot(Arc::clone(&log), Duration::from_millis(200));
+
+        {
+            let mut g = log.lock().await;
+            for i in 0..100u64 {
+                g.append(i, b"periodic-test").await.unwrap();
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut reloaded = SegLog::new("test_periodic".to_string());
+        reloaded.load_snapshot().await.expect("load failed");
+        assert_eq!(reloaded.total_entries(), 100);
     }
 
     #[tokio::test]
     async fn test_segment_boundary_integrity() {
-        let mut log = SegLog::new("test_group".to_string());
+        let log = Arc::new(Mutex::new(SegLog::new("test_group".to_string())));
+        SegLog::start_periodic_snapshot(Arc::clone(&log), Duration::from_secs(60));
 
         let payload_size = 1000;
         let count = 500u64;
+        let mut g = log.lock().await;
 
         for i in 0..count {
             let fill_byte = (i & 0xFF) as u8;
             let payload = vec![fill_byte; payload_size];
-            log.append(i, &payload).await.unwrap();
+            g.append(i, &payload).await.unwrap();
         }
 
-        assert!(
-            log.total_segments() > 1,
-            "test must span multiple segments to be meaningful"
-        );
+        assert!(g.total_segments() > 1);
 
         for id in 1..=count {
-            let (_, ts, data) = log.read(id).unwrap();
+            let (_, ts, data) = g.read(id).unwrap();
             let i = id - 1;
             assert_eq!(ts, i);
             assert_eq!(data.len(), payload_size);
             let expected_byte = (i & 0xFF) as u8;
-            assert!(
-                data.iter().all(|&b| b == expected_byte),
-                "corruption at id={} (segment boundary?), expected 0x{:02X}, got 0x{:02X} at first mismatch",
-                id,
-                expected_byte,
-                data.iter()
-                    .find(|&&b| b != expected_byte)
-                    .copied()
-                    .unwrap_or(0)
-            );
+            assert!(data.iter().all(|&b| b == expected_byte));
         }
     }
 
@@ -584,7 +617,7 @@ mod tests {
         let (s_id, s_ts, s_payload) = log.read(id).unwrap();
         assert_eq!(raw_id, s_id);
         assert_eq!(raw_ts, s_ts);
-        assert_eq!(raw_ts, ts, "timestamp must survive LE roundtrip exactly");
+        assert_eq!(raw_ts, ts);
         assert_eq!(raw_payload, s_payload.as_slice());
         assert_eq!(raw_payload, payload);
     }
@@ -609,7 +642,6 @@ mod tests {
         assert!(log.read(0).is_err());
         assert!(log.read(9999).is_err());
         assert!(log.get_raw_entry_slice(9999).is_err());
-
         assert!(log.read_range(5000, 6000).is_empty());
     }
 
@@ -626,32 +658,6 @@ mod tests {
     }
 }
 
-#[derive(Debug)]
-#[allow(dead_code)]
-pub enum LogError {
-    EntryTooLarge,
-    SegmentLimitReached,
-    EntryNotFound,
-    AllocationFailed,
-    MaxSegmentsReached,
-    WriteLockUnavailable,
-    SnapshotFailed(String),
-}
-impl std::fmt::Display for LogError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LogError::EntryTooLarge => write!(f, "entry exceeds segment capacity"),
-            LogError::SegmentLimitReached => write!(f, "max segment count reached"),
-            LogError::EntryNotFound => write!(f, "entry not found"),
-            LogError::AllocationFailed => write!(f, "failed to allocate memory for segment"),
-            LogError::MaxSegmentsReached => write!(f, "maximum segments reached"),
-            LogError::WriteLockUnavailable => {
-                write!(f, "write lock is currently held by another operation")
-            }
-            LogError::SnapshotFailed(reason) => write!(f, "snapshot failed: {}", reason),
-        }
-    }
-}
 #[cfg(test)]
 mod bench {
     use super::*;
@@ -672,14 +678,18 @@ mod bench {
         const LARGE_PAYLOAD: usize = 4096;
 
         let mut rng: u64 = 0xDEAD_BEEF_CAFE_1234;
-        let mut log = SegLog::new("bench_log".to_string());
 
-        // --- Phase 1: Sequential append (warm up segments) ---
+        let log = Arc::new(Mutex::new(SegLog::new("bench_log".to_string())));
+        SegLog::start_periodic_snapshot(Arc::clone(&log), SNAPSHOT_INTERVAL);
+
         let payload = vec![0xABu8; SMALL_PAYLOAD];
         let t = Instant::now();
-        for i in 0..TOTAL_OPS / 2 {
-            let ts = 1_700_000_000_000 + i * 10;
-            log.append(ts, &payload).await.unwrap();
+        {
+            let mut g = log.lock().await;
+            for i in 0..TOTAL_OPS / 2 {
+                let ts = 1_700_000_000_000 + i * 10;
+                g.append(ts, &payload).await.unwrap();
+            }
         }
         let half = TOTAL_OPS / 2;
         let elapsed = t.elapsed();
@@ -688,16 +698,18 @@ mod bench {
             half,
             elapsed.as_secs_f64() * 1000.0,
             half as f64 / elapsed.as_secs_f64(),
-            log.total_segments()
+            log.lock().await.total_segments()
         );
 
-        // --- Phase 2: Large payload appends (segment boundary stress) ---
         let large_payload = vec![0xCDu8; LARGE_PAYLOAD];
         let t = Instant::now();
         let mut large_ids = Vec::new();
-        for i in 0..1000u64 {
-            let id = log.append(9_000_000 + i, &large_payload).await.unwrap();
-            large_ids.push(id);
+        {
+            let mut g = log.lock().await;
+            for i in 0..1000u64 {
+                let id = g.append(9_000_000 + i, &large_payload).await.unwrap();
+                large_ids.push(id);
+            }
         }
         let elapsed = t.elapsed();
         println!(
@@ -705,17 +717,19 @@ mod bench {
             LARGE_PAYLOAD / 1024,
             elapsed.as_secs_f64() * 1000.0,
             1000.0 / elapsed.as_secs_f64(),
-            log.total_segments()
+            log.lock().await.total_segments()
         );
 
-        // --- Phase 3: Random reads across all written entries ---
-        let max_id = log.next_id() - 1;
+        let max_id = log.lock().await.next_id() - 1;
         let t = Instant::now();
         let mut hits = 0u64;
-        for _ in 0..100_000 {
-            let id = (xorshift64(&mut rng) % max_id) + 1;
-            if log.read(id).is_ok() {
-                hits += 1;
+        {
+            let g = log.lock().await;
+            for _ in 0..100_000 {
+                let id = (xorshift64(&mut rng) % max_id) + 1;
+                if g.read(id).is_ok() {
+                    hits += 1;
+                }
             }
         }
         let elapsed = t.elapsed();
@@ -726,31 +740,35 @@ mod bench {
             hits
         );
 
-        // --- Phase 4: read_range over varying window sizes ---
         let windows = [(1, 100), (100, 500), (1000, 2000), (5000, 5999)];
-        for (start, end) in windows {
-            let t = Instant::now();
-            let results = log.read_range(start, end);
-            let elapsed = t.elapsed();
-            println!(
-                "[read_range] id {}..={} => {} entries in {:.3}ms",
-                start,
-                end,
-                results.len(),
-                elapsed.as_secs_f64() * 1000.0
-            );
+        {
+            let g = log.lock().await;
+            for (start, end) in windows {
+                let t = Instant::now();
+                let results = g.read_range(start, end);
+                let elapsed = t.elapsed();
+                println!(
+                    "[read_range] id {}..={} => {} entries in {:.3}ms",
+                    start,
+                    end,
+                    results.len(),
+                    elapsed.as_secs_f64() * 1000.0
+                );
+            }
         }
 
-        // --- Phase 5: Multi-key simulation (append per logical key) ---
         let mut key_last_id: Vec<u64> = vec![0; NUM_KEYS as usize];
         let t = Instant::now();
-        for _ in 0..TOTAL_OPS / 2 {
-            let key = xorshift64(&mut rng) % NUM_KEYS;
-            let ts = xorshift64(&mut rng);
-            let size = (xorshift64(&mut rng) % 512 + 32) as usize;
-            let payload = vec![(key & 0xFF) as u8; size];
-            let id = log.append(ts, &payload).await.unwrap();
-            key_last_id[key as usize] = id;
+        {
+            let mut g = log.lock().await;
+            for _ in 0..TOTAL_OPS / 2 {
+                let key = xorshift64(&mut rng) % NUM_KEYS;
+                let ts = xorshift64(&mut rng);
+                let size = (xorshift64(&mut rng) % 512 + 32) as usize;
+                let payload = vec![(key & 0xFF) as u8; size];
+                let id = g.append(ts, &payload).await.unwrap();
+                key_last_id[key as usize] = id;
+            }
         }
         let elapsed = t.elapsed();
         let ops = TOTAL_OPS / 2;
@@ -760,58 +778,65 @@ mod bench {
             NUM_KEYS,
             elapsed.as_secs_f64() * 1000.0,
             ops as f64 / elapsed.as_secs_f64(),
-            log.total_segments()
+            log.lock().await.total_segments()
         );
 
-        // --- Phase 6: Verify last written entry per key ---
-        let mut verified = 0;
-        for (key, &id) in key_last_id.iter().enumerate() {
-            if id == 0 {
-                continue;
+        {
+            let g = log.lock().await;
+            let mut verified = 0;
+            for (key, &id) in key_last_id.iter().enumerate() {
+                if id == 0 {
+                    continue;
+                }
+                let (read_id, _, data) = g.read(id).unwrap();
+                assert_eq!(read_id, id);
+                assert_eq!(data[0], (key & 0xFF) as u8);
+                verified += 1;
             }
-            let (read_id, _, data) = log.read(id).unwrap();
-            assert_eq!(read_id, id);
-            assert_eq!(data[0], (key & 0xFF) as u8);
-            verified += 1;
+            println!("[verify] {}/{} keys verified", verified, NUM_KEYS);
         }
-        println!(
-            "[verify] {}/{} keys verified after multi-key phase",
-            verified, NUM_KEYS
-        );
 
-        // --- Phase 7: Trim bottom half and measure index compaction ---
         let cutoff = max_id / 2;
-        let before = log.total_entries();
+        let (before, trimmed_len, after) = {
+            let mut g = log.lock().await;
+            let before = g.total_entries();
+            let t = Instant::now();
+            let trimmed = g.trim(cutoff);
+            let elapsed = t.elapsed();
+            let after = g.total_entries();
+            println!(
+                "[trim] cutoff={} | removed {} entries in {:.3}ms | entries: {} -> {}",
+                cutoff,
+                trimmed.len(),
+                elapsed.as_secs_f64() * 1000.0,
+                before,
+                after
+            );
+            (before, trimmed.len(), after)
+        };
+        let _ = (before, trimmed_len, after);
+
+        {
+            let g = log.lock().await;
+            assert!(g.read(1).is_err());
+            assert!(g.read(cutoff).is_ok());
+        }
+
+        let id_post = {
+            let mut g = log.lock().await;
+            let pre_trim_next = g.next_id();
+            let id_post = g.append(u64::MAX, b"post-trim").await.unwrap();
+            assert_eq!(id_post, pre_trim_next);
+            let (_, ts, data) = g.read(id_post).unwrap();
+            assert_eq!(ts, u64::MAX);
+            assert_eq!(data, b"post-trim");
+            println!("[post-trim-append] id={} ok", id_post);
+            id_post
+        };
+
+        let entries_before_snap = log.lock().await.total_entries();
         let t = Instant::now();
-        let trimmed = log.trim(cutoff);
-        let elapsed = t.elapsed();
-        let after = log.total_entries();
-        println!(
-            "[trim] cutoff={} | removed {} entries in {:.3}ms | entries: {} -> {}",
-            cutoff,
-            trimmed.len(),
-            elapsed.as_secs_f64() * 1000.0,
-            before,
-            after
-        );
-
-        // confirm trim boundary
-        assert!(log.read(1).is_err(), "trimmed entry must be gone");
-        assert!(log.read(cutoff).is_ok(), "cutoff entry must survive");
-
-        // --- Phase 8: Append after trim (ID continuity) ---
-        let pre_trim_next = log.next_id();
-        let id_post = log.append(u64::MAX, b"post-trim").await.unwrap();
-        assert_eq!(id_post, pre_trim_next, "ID must continue after trim");
-        let (_, ts, data) = log.read(id_post).unwrap();
-        assert_eq!(ts, u64::MAX);
-        assert_eq!(data, b"post-trim");
-        println!("[post-trim-append] id={} ok", id_post);
-
-        // --- Phase 9: Snapshot + reload integrity ---
-        let entries_before_snap = log.total_entries();
-        let t = Instant::now();
-        log.snapshot().await.expect("snapshot failed");
+        log.lock().await.snapshot().await.expect("snapshot failed");
         let snap_time = t.elapsed();
 
         let mut reloaded = SegLog::new("bench_log".to_string());
@@ -822,13 +847,9 @@ mod bench {
             .expect("load_snapshot failed");
         let load_time = t.elapsed();
 
-        assert_eq!(
-            reloaded.total_entries(),
-            entries_before_snap,
-            "entry count must match after reload"
-        );
+        assert_eq!(reloaded.total_entries(), entries_before_snap);
         let (_, _, d) = reloaded.read(id_post).unwrap();
-        assert_eq!(d, b"post-trim", "post-trim entry must survive snapshot");
+        assert_eq!(d, b"post-trim");
 
         println!(
             "[snapshot] {} entries | save: {:.2}ms | load: {:.2}ms",
@@ -837,11 +858,12 @@ mod bench {
             load_time.as_secs_f64() * 1000.0
         );
 
+        let g = log.lock().await;
         println!(
             "[final] segments: {} | entries: {} | next_id: {}",
-            log.total_segments(),
-            log.total_entries(),
-            log.next_id()
+            g.total_segments(),
+            g.total_entries(),
+            g.next_id()
         );
     }
 }

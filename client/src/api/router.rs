@@ -30,7 +30,7 @@ pub fn build_router(pool: Arc<ClientPool>) -> Router {
         .route("/kv/:db/keys", get(kv_keys))
         .route("/kv/:db/flush", post(kv_flush))
         .with_state(pool);
-
+    // TODO: implement seg_list endpoints
     Router::new().merge(health_route).merge(router).layer(
         CorsLayer::new()
             .allow_origin(Any)
