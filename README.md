@@ -21,6 +21,8 @@ KV wrapper has LRU which improves read time in heavy read workload(the write tim
 
 Seg List which is like redis stack to push, push_range, pop, pop_count, pop_range and flush features
 
+**As this project is built in my free time at first there was no plan for kv store and segmented list so the whole point of AOF in KV and snapshot in segmented log is useless as like redis all this durability matters should be done in a db wrapper for different storage type like redis rdb using a changelog which can further be used in replication**
+
 ## Client
 
 Custom connection pool for connections to server using its own protocol

@@ -1,17 +1,18 @@
-use futures::TryFutureExt;
-use tokio::{fs::File, sync::Mutex};
-// Like redis list you can put entries in groups and each group assign entries for it self
 use crate::{
     lru::{LRU, build_key},
     seg_log::{LogEntry, LogError, SegLog},
 };
+use futures::TryFutureExt;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use tokio::{fs::File, sync::Mutex};
+
 #[derive(Debug)]
 pub enum GroupError {
     GroupNotFound(String),
     GroupAlreadyExists(String),
     LogError(LogError),
 }
+
 impl std::fmt::Display for GroupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -21,11 +22,13 @@ impl std::fmt::Display for GroupError {
         }
     }
 }
+
 impl From<LogError> for GroupError {
     fn from(e: LogError) -> Self {
         GroupError::LogError(e)
     }
 }
+
 pub struct GroupStats {
     pub total_entries: u64,
     pub total_segments: usize,
@@ -37,21 +40,39 @@ struct Group {
     log: Arc<Mutex<SegLog>>,
     lru_cache: LRU<u64, LogEntry>,
 }
+
 impl Group {
-    fn add_cache(&mut self, id: u64, timestamp: u64, payload: &[u8]) {
+    fn new(name: String) -> Self {
+        let log = Arc::new(Mutex::new(SegLog::new(name.clone())));
+        SegLog::start_periodic_snapshot(Arc::clone(&log), Duration::from_secs(60));
+        Group {
+            name,
+            log,
+            lru_cache: LRU::new(100_000, Duration::from_secs(30)),
+        }
+    }
+
+    fn cache_put(&mut self, id: u64, timestamp: u64, payload: &[u8]) {
         let entry = LogEntry {
-            id: id,
-            timestamp: timestamp,
+            id,
+            timestamp,
             len: payload.len(),
             payload: payload.to_vec(),
         };
-        let key = build_key(&self.name, id);
-        self.lru_cache.insert(key, entry);
+        self.lru_cache.insert(build_key(&self.name, id), entry);
+    }
+
+    fn cache_invalidate(&mut self, id: u64) {
+        self.lru_cache.remove(&build_key(&self.name, id));
     }
 }
+
 pub struct GroupManager {
     groups: HashMap<String, Group>,
 }
+
+const SNAPSHOT_DIR: &str = "snapshots";
+const GROUP_NAMES_FILE: &str = "snapshots/group_names";
 
 impl GroupManager {
     pub async fn new() -> Self {
@@ -63,33 +84,31 @@ impl GroupManager {
         });
         manager
     }
+
     pub async fn create_group(&mut self, name: &str) -> Result<(), GroupError> {
         if self.groups.contains_key(name) {
             return Err(GroupError::GroupAlreadyExists(name.to_string()));
         }
-        let log = Arc::new(Mutex::new(SegLog::new(name.to_string())));
-        SegLog::start_periodic_snapshot(Arc::clone(&log), Duration::from_secs(60));
-        let group = Group {
-            name: name.to_string(),
-            log,
-            lru_cache: LRU::new(100_000, Duration::from_secs(30)),
-        };
+        let group = Group::new(name.to_string());
         self.groups.insert(name.to_string(), group);
-        self.snapshot_group(name)
-            .await
-            .expect(&format!("failed to snapshot group '{}'", name));
-
+        self.persist_group_name(name).await.unwrap_or_else(|e| {
+            eprintln!("Failed to persist group name '{}': {}", name, e);
+        });
         Ok(())
     }
+
     pub async fn drop_group(&mut self, name: &str) -> Result<(), GroupError> {
         if self.groups.remove(name).is_none() {
             return Err(GroupError::GroupNotFound(name.to_string()));
         }
-        self.remove_group_snapshot(name)
+        self.remove_group_from_names(name)
             .await
-            .expect(&format!("failed to remove snapshot for group '{}'", name));
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to remove group name '{}': {}", name, e);
+            });
         Ok(())
     }
+
     pub async fn add(
         &mut self,
         group: &str,
@@ -101,23 +120,22 @@ impl GroupManager {
             .get_mut(group)
             .ok_or_else(|| GroupError::GroupNotFound(group.to_owned()))?;
         let id = grp.log.lock().await.append(timestamp, payload).await?;
-        grp.add_cache(id, timestamp, payload);
+        grp.cache_put(id, timestamp, payload);
         Ok(id)
     }
 
     pub async fn add_range(
         &mut self,
         group: &str,
-        entries: &[(u64, &[u8])], // (timestamp, payload)
+        entries: &[(u64, &[u8])],
     ) -> Result<(u64, u64), GroupError> {
+        if entries.is_empty() {
+            return Err(GroupError::LogError(LogError::EntryNotFound));
+        }
         let grp = self
             .groups
             .get_mut(group)
             .ok_or_else(|| GroupError::GroupNotFound(group.to_owned()))?;
-
-        if entries.is_empty() {
-            return Err(GroupError::LogError(LogError::EntryNotFound));
-        }
 
         let first_id = grp
             .log
@@ -125,21 +143,24 @@ impl GroupManager {
             .await
             .append(entries[0].0, entries[0].1)
             .await?;
-        grp.add_cache(first_id, entries[0].0, entries[0].1);
+        grp.cache_put(first_id, entries[0].0, entries[0].1);
         let mut last_id = first_id;
+
         for &(ts, payload) in &entries[1..] {
             let id = grp.log.lock().await.append(ts, payload).await?;
-            grp.add_cache(id, ts, payload);
+            grp.cache_put(id, ts, payload);
             last_id = id;
         }
         Ok((first_id, last_id))
     }
+
     pub async fn read(&mut self, group: &str, id: u64) -> Result<(u64, u64, Vec<u8>), GroupError> {
         let grp = self
             .groups
             .get_mut(group)
             .ok_or_else(|| GroupError::GroupNotFound(group.to_owned()))?;
-        if let Some(cached) = grp.lru_cache.get(&build_key(group, id)) {
+        let key = build_key(&grp.name, id);
+        if let Some(cached) = grp.lru_cache.get(&key) {
             return Ok((cached.id, cached.timestamp, cached.payload.clone()));
         }
         Ok(grp.log.lock().await.read(id)?)
@@ -156,22 +177,24 @@ impl GroupManager {
             .get_mut(group)
             .ok_or_else(|| GroupError::GroupNotFound(group.to_owned()))?;
 
-        let range = end - start + 1;
-        let mut cached: Vec<(u64, u64, Vec<u8>)> = Vec::with_capacity(range as usize);
+        let range_len = (end - start + 1) as usize;
+        let mut cached: Vec<(u64, u64, Vec<u8>)> = Vec::with_capacity(range_len);
         let mut all_cached = true;
+
         for id in start..=end {
-            if let Some(entry) = grp.lru_cache.get(&build_key(group, id)) {
+            if let Some(entry) = grp.lru_cache.get(&build_key(&grp.name, id)) {
                 cached.push((entry.id, entry.timestamp, entry.payload.clone()));
             } else {
                 all_cached = false;
                 break;
             }
         }
-        if all_cached && cached.len() as u64 == range {
+
+        if all_cached && cached.len() == range_len {
             return Ok(cached);
-        } else {
-            Ok(grp.log.lock().await.read_range(start, end))
         }
+
+        Ok(grp.log.lock().await.read_range(start, end))
     }
 
     pub async fn remove(&mut self, group: &str, up_to_id: u64) -> Result<(), GroupError> {
@@ -179,9 +202,9 @@ impl GroupManager {
             .groups
             .get_mut(group)
             .ok_or_else(|| GroupError::GroupNotFound(group.to_owned()))?;
-        let to_remove = grp.log.lock().await.trim(up_to_id);
-        for id in &to_remove {
-            grp.lru_cache.remove(&build_key(group, *id));
+        let removed_ids = grp.log.lock().await.trim(up_to_id);
+        for id in removed_ids {
+            grp.cache_invalidate(id);
         }
         Ok(())
     }
@@ -195,89 +218,97 @@ impl GroupManager {
             .groups
             .get(group)
             .ok_or_else(|| GroupError::GroupNotFound(group.to_owned()))?;
+        let log = grp.log.lock().await;
         Ok(GroupStats {
-            total_entries: grp.log.lock().await.total_entries(),
-            total_segments: grp.log.lock().await.total_segments(),
-            next_id: grp.log.lock().await.next_id(),
+            total_entries: log.total_entries(),
+            total_segments: log.total_segments(),
+            next_id: log.next_id(),
         })
     }
-    async fn snapshot_group(&self, group: &str) -> anyhow::Result<()> {
-        // check if group_names file not exist create it
-        if !tokio::fs::metadata(PathBuf::from("snapshots/group_names"))
-            .await
-            .is_ok()
-        {
-            tokio::fs::create_dir_all("snapshots").await?;
-            File::create(PathBuf::from("snapshots/group_names")).await?;
+
+    async fn persist_group_name(&self, group: &str) -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::fs::create_dir_all(SNAPSHOT_DIR).await?;
+
+        let names_path = PathBuf::from(GROUP_NAMES_FILE);
+        let mut existing = String::new();
+
+        if tokio::fs::metadata(&names_path).await.is_ok() {
+            File::open(&names_path)
+                .await?
+                .read_to_string(&mut existing)
+                .await?;
         }
-        // if group is already listed in group_names file, do nothing
-        let mut log_file = File::open(PathBuf::from("snapshots/group_names")).await?;
-        let mut contents = String::new();
-        use tokio::io::AsyncReadExt;
-        log_file.read_to_string(&mut contents).await?;
-        let mut group_names: Vec<String> = contents.lines().map(|s| s.to_string()).collect();
-        if group_names.contains(&group.to_string()) {
+
+        let names: Vec<&str> = existing.lines().filter(|s| !s.is_empty()).collect();
+        if names.contains(&group) {
             return Ok(());
         }
-        if !group_names.contains(&group.to_string()) {
-            group_names.push(group.to_string());
-            let new_contents = group_names.join("\n");
-            use tokio::io::AsyncWriteExt;
-            let mut log_file = File::create(PathBuf::from("snapshots/group_names")).await?;
-            log_file.write_all(new_contents.as_bytes()).await?;
-        }
+
+        let mut all: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        all.push(group.to_string());
+
+        let mut f = File::create(&names_path).await?;
+        f.write_all(all.join("\n").as_bytes()).await?;
         Ok(())
     }
-    async fn load_group_names(&self) -> anyhow::Result<Vec<String>> {
-        let mut log_file = File::open(PathBuf::from("snapshots/group_names")).await?;
-        let mut contents = String::new();
-        use tokio::io::AsyncReadExt;
-        log_file.read_to_string(&mut contents).await?;
-        let group_names: Vec<String> = contents.lines().map(|s| s.to_string()).collect();
-        Ok(group_names)
-    }
-    async fn remove_group_snapshot(&self, group: &str) -> anyhow::Result<()> {
-        // if group_names file not exist, do nothing
-        if !tokio::fs::metadata(PathBuf::from("snapshots/group_names"))
-            .await
-            .is_ok()
-        {
+
+    async fn remove_group_from_names(&self, group: &str) -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let names_path = PathBuf::from(GROUP_NAMES_FILE);
+        if tokio::fs::metadata(&names_path).await.is_err() {
             return Ok(());
         }
-        let mut log_file = File::open(PathBuf::from("snapshots/group_names")).await?;
+
         let mut contents = String::new();
-        use tokio::io::AsyncReadExt;
-        log_file.read_to_string(&mut contents).await?;
-        let group_names: Vec<String> = contents
+        File::open(&names_path)
+            .await?
+            .read_to_string(&mut contents)
+            .await?;
+
+        let names: Vec<String> = contents
             .lines()
+            .filter(|s| !s.is_empty() && *s != group)
             .map(|s| s.to_string())
-            .filter(|s| s != group)
             .collect();
-        let new_contents = group_names.join("\n");
-        use tokio::io::AsyncWriteExt;
-        let mut log_file = File::create(PathBuf::from("snapshots/group_names")).await?;
-        log_file.write_all(new_contents.as_bytes()).await?;
+
+        let mut f = File::create(&names_path).await?;
+        f.write_all(names.join("\n").as_bytes()).await?;
         Ok(())
     }
 
     async fn load_snapshot(&mut self) -> anyhow::Result<()> {
-        // load snapshot for each group
-        let group_names = self.load_group_names().await?;
-        for grp in group_names {
-            let grp = grp.clone();
-            let group = self.groups.get_mut(&grp).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "group '{}' listed in snapshot but not found in manager",
-                    grp
-                )
-            })?;
+        use tokio::io::AsyncReadExt;
+
+        let names_path = PathBuf::from(GROUP_NAMES_FILE);
+        if tokio::fs::metadata(&names_path).await.is_err() {
+            return Ok(());
+        }
+
+        let mut contents = String::new();
+        File::open(&names_path)
+            .await?
+            .read_to_string(&mut contents)
+            .await?;
+
+        let group_names: Vec<String> = contents
+            .lines()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        for name in group_names {
+            let group = Group::new(name.clone());
             group
                 .log
                 .lock()
                 .await
                 .load_snapshot()
-                .map_err(|e| anyhow::anyhow!("failed to load snapshot for group '{}': {}", grp, e))
+                .map_err(|e| anyhow::anyhow!("failed to load snapshot for group '{}': {}", name, e))
                 .await?;
+            self.groups.insert(name, group);
         }
 
         Ok(())
@@ -288,8 +319,18 @@ impl GroupManager {
 mod tests {
     use super::*;
 
+    async fn cleanup() {
+        let _ = tokio::fs::remove_file(GROUP_NAMES_FILE).await;
+        for name in ["g1", "g2"] {
+            let _ = tokio::fs::remove_dir_all(format!("segments/{}", name)).await;
+            let _ = tokio::fs::remove_dir_all(format!("snapshots/{}", name)).await;
+        }
+    }
+
     #[tokio::test]
     async fn test_full_cycle() {
+        cleanup().await;
+
         let mut m = GroupManager::new().await;
 
         assert!(m.create_group("g1").await.is_ok());
@@ -358,5 +399,7 @@ mod tests {
         assert_eq!(post, 7);
         let (_, _, pd) = m.read("g1", 7).await.unwrap();
         assert_eq!(pd, b"after-trim");
+
+        cleanup().await;
     }
 }
