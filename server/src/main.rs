@@ -5,6 +5,7 @@ mod groups;
 mod kv;
 mod lru;
 mod proto;
+mod seg_list;
 mod seg_log;
 mod server;
 #[tokio::main]

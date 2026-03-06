@@ -14,7 +14,7 @@ use tokio::{
 const SEGMENT_SIZE: usize = 64 * 1024; // 64KB per segment for better cpu cache
 const SEGMENT_ALIGN: usize = 4096; // 4Kb for align to os page boundary and better direct mem access
 const INITIAL_SEGMENTS: usize = 8; // pre allocate 8 segments 
-const MAX_SEGMENTS: usize = 1024 * 16; // max 1GB log size
+const MAX_SEGMENTS: usize = 1024 * 1024 * 1024; // 1 GB
 
 #[derive(Debug, Clone, Copy)]
 struct EntryLoc {
@@ -48,7 +48,7 @@ impl SegLog {
     pub fn new(identifier: String) -> Self {
         let seg_layout = Layout::from_size_align(SEGMENT_SIZE, SEGMENT_ALIGN).unwrap();
         // pre alloc segmetns
-        let mut segs = Vec::with_capacity(MAX_SEGMENTS);
+        let mut segs: Vec<*mut u8> = Vec::with_capacity(MAX_SEGMENTS);
         for _ in 0..INITIAL_SEGMENTS {
             let ptr = unsafe { alloc_zeroed(seg_layout) };
             if ptr.is_null() {

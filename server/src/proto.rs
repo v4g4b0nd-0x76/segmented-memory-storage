@@ -12,6 +12,13 @@ pub const CMD_GET: u8 = 0x11;
 pub const CMD_DEL: u8 = 0x12;
 pub const CMD_KEYS: u8 = 0x13;
 pub const CMD_FLUSH: u8 = 0x14;
+pub const LPUSH: u8 = 0x15;
+pub const LPUSH_RANGE: u8 = 0x16;
+pub const LPOP: u8 = 0x17;
+pub const LPOP_RANGE: u8 = 0x18;
+pub const LPOP_COUNT: u8 = 0x19;
+pub const LLEN: u8 = 0x20;
+pub const LFLUSH: u8 = 0x21;
 
 pub const STATUS_OK: u8 = 0x00;
 pub const STATUS_ERR: u8 = 0x01;
@@ -69,6 +76,32 @@ pub enum Command<'a> {
     },
     Flush {
         db: &'a str,
+    },
+    LPush {
+        key: &'a str,
+        val: &'a [u8],
+    },
+    LPushRange {
+        key: &'a str,
+        vals: Vec<&'a [u8]>,
+    },
+    LPop {
+        key: &'a str,
+    },
+    LPopRange {
+        key: &'a str,
+        start: u32,
+        end: u32,
+    },
+    LPopCount {
+        key: &'a str,
+        count: u32,
+    },
+    LLen {
+        key: &'a str,
+    },
+    LFlush {
+        key: &'a str,
     },
 }
 
@@ -137,7 +170,7 @@ impl<'a> Cursor<'a> {
             return Err(ParseError("unexpected EOF reading string"));
         }
         let s = std::str::from_utf8(&self.buf[self.pos..self.pos + len])
-            .map_err(|_| ParseError("invalid UTF-8 in group name"))?;
+            .map_err(|_| ParseError("invalid UTF-8"))?;
         self.pos += len;
         Ok(s)
     }
@@ -163,14 +196,12 @@ pub fn parse_command(frame: &[u8]) -> Result<Command<'_>, ParseError> {
     let tag = cur.read_u8()?;
 
     match tag {
-        CMD_CREATE_GROUP => {
-            let name = cur.read_str()?;
-            Ok(Command::CreateGroup { name })
-        }
-        CMD_DROP_GROUP => {
-            let name = cur.read_str()?;
-            Ok(Command::DropGroup { name })
-        }
+        CMD_CREATE_GROUP => Ok(Command::CreateGroup {
+            name: cur.read_str()?,
+        }),
+        CMD_DROP_GROUP => Ok(Command::DropGroup {
+            name: cur.read_str()?,
+        }),
         CMD_ADD => {
             let group = cur.read_str()?;
             let timestamp = cur.read_u64_le()?;
@@ -209,15 +240,85 @@ pub fn parse_command(frame: &[u8]) -> Result<Command<'_>, ParseError> {
             Ok(Command::Remove { group, up_to_id })
         }
         CMD_LIST_GROUPS => Ok(Command::ListGroups),
-        CMD_GROUP_STATS => {
-            let group = cur.read_str()?;
-            Ok(Command::GroupStats { group })
+        CMD_GROUP_STATS => Ok(Command::GroupStats {
+            group: cur.read_str()?,
+        }),
+        CMD_SET => {
+            let db = cur.read_str()?;
+            let key = cur.read_str()?;
+            let ttl_secs = cur.read_u64_le()?;
+            let val = cur.read_bytes()?;
+            Ok(Command::SetKey {
+                db,
+                key,
+                val,
+                ttl_secs,
+            })
+        }
+        CMD_GET => {
+            let db = cur.read_str()?;
+            let key = cur.read_str()?;
+            Ok(Command::GetKey { db, key })
+        }
+        CMD_DEL => {
+            let db = cur.read_str()?;
+            let key = cur.read_str()?;
+            Ok(Command::DelKey { db, key })
+        }
+        CMD_KEYS => Ok(Command::Keys {
+            db: cur.read_str()?,
+        }),
+        CMD_FLUSH => Ok(Command::Flush {
+            db: cur.read_str()?,
+        }),
+        LPUSH => {
+            let db = cur.read_str()?;
+            let key = cur.read_str()?;
+            let val = cur.read_bytes()?;
+            Ok(Command::LPush { key, val })
+        }
+        LPUSH_RANGE => {
+            let db = cur.read_str()?;
+            let key = cur.read_str()?;
+            let count = cur.read_u32_le()? as usize;
+            let mut vals = Vec::with_capacity(count);
+            for _ in 0..count {
+                vals.push(cur.read_bytes()?);
+            }
+            Ok(Command::LPushRange { key, vals })
+        }
+        LPOP => {
+            let db = cur.read_str()?;
+            let key = cur.read_str()?;
+            Ok(Command::LPop { key })
+        }
+        LPOP_RANGE => {
+            let db = cur.read_str()?;
+            let key = cur.read_str()?;
+            let start = cur.read_u32_le()?;
+            let end = cur.read_u32_le()?;
+            Ok(Command::LPopRange { key, start, end })
+        }
+        LPOP_COUNT => {
+            let db = cur.read_str()?;
+            let key = cur.read_str()?;
+            let count = cur.read_u32_le()?;
+            Ok(Command::LPopCount { key, count })
+        }
+        LLEN => {
+            let db = cur.read_str()?;
+            let key = cur.read_str()?;
+            Ok(Command::LLen { key })
+        }
+        LFLUSH => {
+            let db = cur.read_str()?;
+            let key = cur.read_str()?;
+            Ok(Command::LFlush { key })
         }
         _ => Err(ParseError("unknown command tag")),
     }
 }
 
-/// Returns the total frame size (4-byte length prefix + status + body).
 pub struct ResponseBuilder {
     buf: Vec<u8>,
 }
@@ -231,7 +332,6 @@ impl ResponseBuilder {
 
     pub fn ok_empty(&mut self) -> &[u8] {
         self.buf.clear();
-
         self.buf.extend_from_slice(&[0u8; 4]);
         self.buf.push(STATUS_OK);
         self.finalize()
@@ -330,6 +430,20 @@ impl ResponseBuilder {
         self.finalize()
     }
 
+    pub fn ok_bytes_list(&mut self, items: &[Vec<u8>]) -> &[u8] {
+        self.buf.clear();
+        self.buf.extend_from_slice(&[0u8; 4]);
+        self.buf.push(STATUS_OK);
+        self.buf
+            .extend_from_slice(&(items.len() as u32).to_le_bytes());
+        for item in items {
+            self.buf
+                .extend_from_slice(&(item.len() as u32).to_le_bytes());
+            self.buf.extend_from_slice(item);
+        }
+        self.finalize()
+    }
+
     pub fn err(&mut self, msg: &str) -> &[u8] {
         self.buf.clear();
         self.buf.extend_from_slice(&[0u8; 4]);
@@ -341,7 +455,7 @@ impl ResponseBuilder {
     }
 
     fn finalize(&mut self) -> &[u8] {
-        let body_len = (self.buf.len() - 4) as u32; // everything after the 4-byte length prefix
+        let body_len = (self.buf.len() - 4) as u32;
         let len_bytes = body_len.to_le_bytes();
         self.buf[0] = len_bytes[0];
         self.buf[1] = len_bytes[1];
