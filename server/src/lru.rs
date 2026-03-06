@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
-
+#[derive(Clone, Debug)]
 struct Entry<V> {
     value: V,
     expires_at: Instant,
@@ -9,8 +9,10 @@ struct Entry<V> {
     next: usize,
 }
 
+#[derive(Clone, Debug)]
 pub struct LRU<K, V> {
     map: HashMap<K, usize>,
+    reverse: Vec<Option<K>>,
     entries: Vec<Option<Entry<V>>>,
     free: Vec<usize>,
     head: usize,
@@ -28,6 +30,7 @@ where
     pub fn new(cap: usize, ttl: Duration) -> Self {
         Self {
             map: HashMap::with_capacity(cap),
+            reverse: Vec::with_capacity(cap),
             entries: Vec::with_capacity(cap),
             free: Vec::new(),
             head: NULL,
@@ -37,12 +40,14 @@ where
         }
     }
 
-    fn alloc_slot(&mut self, entry: Entry<V>) -> usize {
+    fn alloc_slot(&mut self, key: K, entry: Entry<V>) -> usize {
         if let Some(idx) = self.free.pop() {
             self.entries[idx] = Some(entry);
+            self.reverse[idx] = Some(key);
             idx
         } else {
             self.entries.push(Some(entry));
+            self.reverse.push(Some(key));
             self.entries.len() - 1
         }
     }
@@ -95,26 +100,25 @@ where
             let evict = self.tail;
             if evict != NULL {
                 self.detach(evict);
-                let old_key = {
-                    self.map
-                        .iter()
-                        .find(|(_, v)| **v == evict)
-                        .map(|(k, _)| k.clone())
-                };
-                if let Some(k) = old_key {
-                    self.map.remove(&k);
+                if let Some(Some(old_key)) = self.reverse.get_mut(evict) {
+                    let old_key = old_key.clone();
+                    self.map.remove(&old_key);
                 }
                 self.entries[evict] = None;
+                self.reverse[evict] = None;
                 self.free.push(evict);
             }
         }
 
-        let idx = self.alloc_slot(Entry {
-            value,
-            expires_at,
-            prev: NULL,
-            next: NULL,
-        });
+        let idx = self.alloc_slot(
+            key.clone(),
+            Entry {
+                value,
+                expires_at,
+                prev: NULL,
+                next: NULL,
+            },
+        );
         self.map.insert(key, idx);
         self.attach_front(idx);
     }
@@ -134,6 +138,7 @@ where
     pub fn remove(&mut self, key: &K) -> Option<V> {
         let idx = self.map.remove(key)?;
         self.detach(idx);
+        self.reverse[idx] = None;
         let entry = self.entries[idx].take()?;
         self.free.push(idx);
         Some(entry.value)

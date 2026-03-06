@@ -18,7 +18,7 @@ impl Server {
     pub async fn new() -> Self {
         Server {
             group_manager: Arc::new(RwLock::new(GroupManager::new().await)),
-            kv_store: Arc::new(RwLock::new(KvStore::new().await)),
+            kv_store: Arc::new(RwLock::new(KvStore::new(None).await)),
             list: Arc::new(RwLock::new(SegList::new().await)),
         }
     }

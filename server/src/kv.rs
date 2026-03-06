@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use anyhow::{Ok, anyhow};
 use serde::{Deserialize, Serialize};
@@ -7,6 +7,8 @@ use tokio::{
     io::AsyncWriteExt,
     sync::mpsc::{self, UnboundedSender},
 };
+
+use crate::lru::{self, LRU};
 
 const AOF_DIR: &str = "aof";
 
@@ -166,15 +168,26 @@ impl DB {
 
 pub struct KvStore {
     dbs: HashMap<String, DB>,
+    lru: LRU<String, DBEntry>,
+    lru_size: usize,
 }
 
 impl KvStore {
-    pub async fn new() -> Self {
+    fn cache_key(db: &str, key: &str) -> String {
+        format!("{}:{}", db, key)
+    }
+
+    pub async fn new(lru_size: Option<usize>) -> Self {
         let dbs = load_dbs().await.unwrap_or_else(|e| {
             eprintln!("failed to load dbs: {:#?}", e);
             HashMap::new()
         });
-        KvStore { dbs }
+        let lru_size = lru_size.unwrap_or(100_000);
+        KvStore {
+            dbs,
+            lru: LRU::new(lru_size, Duration::from_secs(60)),
+            lru_size,
+        }
     }
 
     async fn get_db_mut(&mut self, db: &str) -> anyhow::Result<&mut DB> {
@@ -207,16 +220,26 @@ impl KvStore {
         } else {
             chrono::Utc::now().timestamp_millis() + ttl
         };
+        self.lru.remove(&Self::cache_key(&db, &key));
         let db = self.get_db_mut(&db).await?;
         db.set(key, DBEntry { val, ttl: ttl_ts })
     }
 
     pub async fn get(&mut self, db: String, key: String) -> anyhow::Result<Option<DBEntry>> {
-        let db = self.get_db_mut(&db).await?;
-        db.get(key)
+        let ck = Self::cache_key(&db, &key);
+        if let Some(entry) = self.lru.get(&ck) {
+            return Ok(Some(entry.clone()));
+        }
+        let db_ref = self.get_db_mut(&db).await?;
+        let result = db_ref.get(key)?;
+        if let Some(ref entry) = result {
+            self.lru.insert(ck, entry.clone());
+        }
+        Ok(result)
     }
 
     pub async fn del(&mut self, db: String, key: String) -> anyhow::Result<()> {
+        self.lru.remove(&Self::cache_key(&db, &key));
         let db = self.get_db_mut(&db).await?;
         db.del(key)
     }
@@ -228,7 +251,9 @@ impl KvStore {
 
     pub async fn flush(&mut self, db: String) -> anyhow::Result<()> {
         let db = self.get_db_mut(&db).await?;
-        db.flush().await
+        db.flush().await?;
+        self.lru = LRU::new(self.lru_size, Duration::from_secs(60));
+        Ok(())
     }
 
     pub async fn create_db(&mut self, id: String) -> anyhow::Result<()> {
@@ -315,7 +340,7 @@ mod tests {
         let db_id = "test_cycle";
         cleanup(db_id).await;
 
-        let mut store = KvStore::new().await;
+        let mut store = KvStore::new(None).await;
         store
             .set(db_id.to_string(), "k1".to_string(), b"hello".to_vec(), 0)
             .await
@@ -359,7 +384,7 @@ mod tests {
         cleanup(db_id).await;
 
         {
-            let mut store = KvStore::new().await;
+            let mut store = KvStore::new(None).await;
             store
                 .set(db_id.to_string(), "key1".to_string(), b"val1".to_vec(), 0)
                 .await
@@ -375,7 +400,7 @@ mod tests {
             store.shutdown().await;
         }
 
-        let mut store2 = KvStore::new().await;
+        let mut store2 = KvStore::new(None).await;
         let v1 = store2
             .get(db_id.to_string(), "key1".to_string())
             .await
@@ -406,11 +431,11 @@ mod bench {
     async fn bench_kv_realistic() {
         cleanup_bench().await;
 
-        let total: usize = 1_000_000;
-        let unique_keys: usize = 200_000;
+        let total: usize = 5_000_000;
+        let unique_keys: usize = 2_000_000;
         let db = "bench_db".to_string();
 
-        let mut store = KvStore::new().await;
+        let mut store = KvStore::new(Some(unique_keys)).await;
 
         // --- Phase 1: Write 1M keys (with duplicates) ---
         println!(
@@ -482,7 +507,7 @@ mod bench {
         store.shutdown().await;
         drop(store);
         let start = Instant::now();
-        let mut store2 = KvStore::new().await;
+        let mut store2 = KvStore::new(Some(unique_keys)).await;
         let reload_elapsed = start.elapsed();
         println!("[BENCH] AOF reload done: {:?}", reload_elapsed);
 
