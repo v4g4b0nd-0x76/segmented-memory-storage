@@ -11,17 +11,15 @@ Custom tcp frame encoder and decoder with custom fixed sized entries for command
 
 Tokio simple Tcp connection for p2p communication;
 
-Periodic snapshot in separated thread. and load snapshot for seg_logs base on their identifier of any snapshot exists.
-
 LRU in group wrapper level for better performance and less segment access.
 
 Key Value (KV) storage with ttl option and different database isolated access like redis.
-KV has aof using an AOF channel for asynchronous and faster aof write witch runs in different thread for each db.
 KV wrapper has LRU which improves read time in heavy read workload(the write time - reload AOF is downside)
 
 Seg List which is like redis stack to push, push_range, pop, pop_count, pop_range and flush features
 
-**As this project is built in my free time at first there was no plan for kv store and segmented list so the whole point of AOF in KV and snapshot in segmented log is useless as like redis all this durability matters should be done in a db wrapper for different storage type like redis rdb using a changelog which can further be used in replication**
+there is a wrapper around all data sets that has an aof and apply commands done in that aof in order to recreate data
+the aof file can be used as change log for replica follower catchups
 
 ## Client
 

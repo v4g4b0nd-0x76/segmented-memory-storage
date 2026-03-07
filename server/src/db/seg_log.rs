@@ -1,24 +1,16 @@
 use std::{
     alloc::{Layout, alloc_zeroed, dealloc},
     collections::BTreeMap,
-    path::PathBuf,
     ptr,
     sync::Arc,
-    time::Duration,
 };
 
-use serde_json::json;
-use tokio::{
-    fs::{self, File},
-    io::AsyncWriteExt,
-    sync::{Mutex, mpsc},
-};
+use tokio::sync::Mutex;
 
 const SEGMENT_SIZE: usize = 64 * 1024;
 const SEGMENT_ALIGN: usize = 4096;
 const INITIAL_SEGMENTS: usize = 8;
 const MAX_SEGMENTS: usize = 1024 * 1024 * 1024;
-const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy)]
 struct EntryLoc {
@@ -29,17 +21,7 @@ struct EntryLoc {
 
 const HEADER_SIZE: usize = 8 + 8 + 4;
 
-enum SnapshotMsg {
-    Take {
-        entries: Vec<LogEntry>,
-        total_segments: usize,
-        ack: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
-    },
-    Shutdown,
-}
-
 pub struct SegLog {
-    identifier: String,
     segs: Vec<*mut u8>,
     active_seg: usize,
     write_cursor: usize,
@@ -48,13 +30,12 @@ pub struct SegLog {
     entry_count: usize,
     seg_layout: Layout,
     lock_write: tokio::sync::Mutex<()>,
-    snapshot_tx: mpsc::UnboundedSender<SnapshotMsg>,
 }
 
 unsafe impl Send for SegLog {}
 unsafe impl Sync for SegLog {}
 
-#[derive(bitcode::Encode, bitcode::Decode, PartialEq, Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
     pub id: u64,
     pub timestamp: u64,
@@ -63,7 +44,7 @@ pub struct LogEntry {
 }
 
 impl SegLog {
-    pub fn new(identifier: String) -> Self {
+    pub fn new() -> Self {
         let seg_layout = Layout::from_size_align(SEGMENT_SIZE, SEGMENT_ALIGN).unwrap();
         let mut segs: Vec<*mut u8> = Vec::with_capacity(MAX_SEGMENTS);
         for _ in 0..INITIAL_SEGMENTS {
@@ -73,36 +54,7 @@ impl SegLog {
             }
             segs.push(ptr);
         }
-
-        let (tx, mut rx) = mpsc::unbounded_channel::<SnapshotMsg>();
-        let id_clone = identifier.clone();
-
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                match msg {
-                    SnapshotMsg::Shutdown => break,
-                    SnapshotMsg::Take {
-                        entries,
-                        total_segments,
-                        ack,
-                    } => {
-                        let grp = id_clone.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            let rt = tokio::runtime::Handle::current();
-                            rt.block_on(async move {
-                                write_snapshot(&grp, entries, total_segments).await
-                            })
-                        })
-                        .await
-                        .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {e}")));
-                        let _ = ack.send(result);
-                    }
-                }
-            }
-        });
-
         SegLog {
-            identifier,
             segs,
             active_seg: 0,
             write_cursor: 0,
@@ -111,68 +63,7 @@ impl SegLog {
             lock_write: tokio::sync::Mutex::new(()),
             next_id: 1,
             entry_count: 0,
-            snapshot_tx: tx,
         }
-    }
-
-    pub fn start_periodic_snapshot(log: Arc<Mutex<SegLog>>, interval: Duration) {
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                let guard = log.lock().await;
-                let _ = guard.fire_snapshot();
-            }
-        });
-    }
-
-    fn collect_entries(&self) -> Vec<LogEntry> {
-        self.idx
-            .keys()
-            .filter_map(|&id| {
-                self.read(id).ok().map(|(_, ts, payload)| LogEntry {
-                    id,
-                    timestamp: ts,
-                    len: payload.len(),
-                    payload,
-                })
-            })
-            .collect()
-    }
-
-    fn fire_snapshot(&self) -> anyhow::Result<()> {
-        let entries = self.collect_entries();
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let total_segments = self.segs.len();
-        let (ack_tx, _) = tokio::sync::oneshot::channel();
-        self.snapshot_tx
-            .send(SnapshotMsg::Take {
-                entries,
-                total_segments,
-                ack: ack_tx,
-            })
-            .map_err(|_| anyhow::anyhow!("snapshot worker is gone"))
-    }
-
-    pub async fn snapshot(&self) -> anyhow::Result<()> {
-        let entries = self.collect_entries();
-        let total_segments = self.segs.len();
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        self.snapshot_tx
-            .send(SnapshotMsg::Take {
-                entries,
-                total_segments,
-                ack: ack_tx,
-            })
-            .map_err(|_| anyhow::anyhow!("snapshot worker is gone"))?;
-        ack_rx.await?
-    }
-
-    pub async fn shutdown(&self) {
-        let _ = self.snapshot_tx.send(SnapshotMsg::Shutdown);
     }
 
     pub async fn allocate_seg(&mut self) -> Result<(), LogError> {
@@ -232,51 +123,6 @@ impl SegLog {
         self.next_id += 1;
         self.entry_count += 1;
         Ok(entry_id)
-    }
-
-    pub async fn append_with_id(
-        &mut self,
-        id: u64,
-        timestamp: u64,
-        data: &[u8],
-    ) -> Result<u64, LogError> {
-        let total_entry_size = HEADER_SIZE + data.len();
-        if total_entry_size > SEGMENT_SIZE {
-            return Err(LogError::EntryTooLarge);
-        }
-        if self.write_cursor + total_entry_size > SEGMENT_SIZE {
-            self.active_seg += 1;
-            self.write_cursor = 0;
-            if self.active_seg >= self.segs.len() {
-                self.allocate_seg().await?;
-            }
-        }
-
-        let _lock = self.lock_write.lock().await;
-        let dst = unsafe { self.segs[self.active_seg].add(self.write_cursor) };
-        unsafe {
-            ptr::copy_nonoverlapping(id.to_le_bytes().as_ptr(), dst, 8);
-            ptr::copy_nonoverlapping(timestamp.to_le_bytes().as_ptr(), dst.add(8), 8);
-            ptr::copy_nonoverlapping((data.len() as u32).to_le_bytes().as_ptr(), dst.add(16), 4);
-            if !data.is_empty() {
-                ptr::copy_nonoverlapping(data.as_ptr(), dst.add(HEADER_SIZE), data.len());
-            }
-        }
-
-        self.idx.insert(
-            id,
-            EntryLoc {
-                segment_idx: self.active_seg,
-                offset: self.write_cursor,
-                len: total_entry_size,
-            },
-        );
-        self.write_cursor += total_entry_size;
-        self.entry_count += 1;
-        if id >= self.next_id {
-            self.next_id = id + 1;
-        }
-        Ok(id)
     }
 
     pub fn read(&self, entry_id: u64) -> Result<(u64, u64, Vec<u8>), LogError> {
@@ -340,96 +186,6 @@ impl SegLog {
     pub fn next_id(&self) -> u64 {
         self.next_id
     }
-
-    pub async fn load_snapshot(&mut self) -> anyhow::Result<()> {
-        let grp = self.identifier.clone();
-        let dir = "snapshots";
-        let _ = fs::create_dir_all(dir).await;
-
-        let mut read_dir = fs::read_dir(dir).await?;
-        let mut timestamps: Vec<i64> = Vec::new();
-        while let Some(entry) = read_dir.next_entry().await? {
-            let name = entry.file_name();
-            let name_str = match name.to_str() {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            if !name_str.starts_with(&format!("{}_snapshot_", grp))
-                || !name_str.ends_with(".meta.json")
-            {
-                continue;
-            }
-            if let Some(ts) = name_str
-                .strip_prefix(&format!("{}_snapshot_", grp))
-                .and_then(|s| s.strip_suffix(".meta.json"))
-                .and_then(|s| s.parse::<i64>().ok())
-            {
-                timestamps.push(ts);
-            }
-        }
-
-        timestamps.sort_unstable_by(|a, b| b.cmp(a));
-
-        let mut snapshot_path: Option<PathBuf> = None;
-        for ts in timestamps {
-            let meta_pth = PathBuf::from(format!("{}/{}_snapshot_{}.meta.json", dir, grp, ts));
-            if let Ok(content) = fs::read_to_string(&meta_pth).await {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if json.get("completed").and_then(|v| v.as_bool()) == Some(true) {
-                        snapshot_path = Some(PathBuf::from(format!(
-                            "{}/{}_snapshot_{}.bin",
-                            dir, grp, ts
-                        )));
-                        break;
-                    }
-                }
-            }
-        }
-
-        let path = match snapshot_path {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-
-        let data = fs::read(&path).await?;
-        let entries: Vec<LogEntry> = bitcode::decode(&data)?;
-        for entry in entries {
-            self.append_with_id(entry.id, entry.timestamp, &entry.payload)
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to load entry {}: {}", entry.id, e))?;
-        }
-        Ok(())
-    }
-}
-
-async fn write_snapshot(
-    grp: &str,
-    entries: Vec<LogEntry>,
-    total_segments: usize,
-) -> anyhow::Result<()> {
-    let ts = chrono::Utc::now().timestamp_millis();
-    let dir = "snapshots";
-    fs::create_dir_all(dir).await?;
-
-    let bin_path = PathBuf::from(format!("{}/{}_snapshot_{}.bin", dir, grp, ts));
-    let meta_path = PathBuf::from(format!("{}/{}_snapshot_{}.meta.json", dir, grp, ts));
-
-    let buf = bitcode::encode(&entries);
-    let mut f = File::create(&bin_path).await?;
-    f.write_all(&buf).await?;
-    f.sync_all().await?;
-
-    let meta = json!({
-        "group": grp,
-        "timestamp": ts,
-        "total_segments": total_segments,
-        "completed": true,
-    });
-    let mut mf = File::create(&meta_path).await?;
-    mf.write_all(meta.to_string().as_bytes()).await?;
-    mf.sync_all().await?;
-
-    Ok(())
 }
 
 impl Drop for SegLog {
@@ -453,7 +209,6 @@ pub enum LogError {
     AllocationFailed,
     MaxSegmentsReached,
     WriteLockUnavailable,
-    SnapshotFailed(String),
 }
 
 impl std::fmt::Display for LogError {
@@ -467,7 +222,6 @@ impl std::fmt::Display for LogError {
             LogError::WriteLockUnavailable => {
                 write!(f, "write lock is currently held by another operation")
             }
-            LogError::SnapshotFailed(reason) => write!(f, "snapshot failed: {}", reason),
         }
     }
 }
@@ -478,119 +232,69 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_lifecycle() {
-        let log = Arc::new(Mutex::new(SegLog::new("test_group".to_string())));
-        SegLog::start_periodic_snapshot(Arc::clone(&log), Duration::from_secs(60));
-
+        let mut log = SegLog::new();
         let entry_count = 1000u64;
-        {
-            let mut g = log.lock().await;
-            for i in 0..entry_count {
-                let ts = 1700000000000 + i * 50;
-                let payload = format!(
-                    "sensor:temp-{} value:{}.{} unit:c",
-                    i % 10,
-                    20 + (i % 15),
-                    i % 100
-                );
-                g.append(ts, payload.as_bytes()).await.unwrap();
-            }
-            assert_eq!(g.total_entries(), entry_count);
 
-            let samples = [1u64, 50, 250, 500, 750, 999, 1000];
-            for &id in &samples {
-                let (read_id, read_ts, data) = g.read(id).unwrap();
-                assert_eq!(read_id, id);
-                let i = id - 1;
-                assert_eq!(read_ts, 1700000000000 + i * 50);
-                let expected = format!(
-                    "sensor:temp-{} value:{}.{} unit:c",
-                    i % 10,
-                    20 + (i % 15),
-                    i % 100
-                );
-                assert_eq!(data, expected.as_bytes());
-            }
+        for i in 0..entry_count {
+            let ts = 1700000000000 + i * 50;
+            let payload = format!(
+                "sensor:temp-{} value:{}.{} unit:c",
+                i % 10,
+                20 + (i % 15),
+                i % 100
+            );
+            log.append(ts, payload.as_bytes()).await.unwrap();
+        }
+        assert_eq!(log.total_entries(), entry_count);
 
-            let range = g.read_range(100, 109);
-            assert_eq!(range.len(), 10);
-            for (idx, (id, _, _)) in range.iter().enumerate() {
-                assert_eq!(*id, 100 + idx as u64);
-            }
-
-            g.trim(501);
-            assert_eq!(g.total_entries(), 500);
-            assert!(g.read(1).is_err());
-            assert!(g.read(500).is_err());
-            assert!(g.read(501).is_ok());
-
-            let new_id = g.append(9999999999999, b"post-trim-event").await.unwrap();
-            assert_eq!(new_id, entry_count + 1);
-            let (_, _, data) = g.read(new_id).unwrap();
-            assert_eq!(data, b"post-trim-event");
-
-            g.snapshot().await.expect("snapshot save failed");
+        for &id in &[1u64, 50, 250, 500, 750, 999, 1000] {
+            let (read_id, read_ts, data) = log.read(id).unwrap();
+            assert_eq!(read_id, id);
+            let i = id - 1;
+            assert_eq!(read_ts, 1700000000000 + i * 50);
+            let expected = format!(
+                "sensor:temp-{} value:{}.{} unit:c",
+                i % 10,
+                20 + (i % 15),
+                i % 100
+            );
+            assert_eq!(data, expected.as_bytes());
         }
 
-        let mut loaded_log = SegLog::new("test_group".to_string());
-        loaded_log
-            .load_snapshot()
-            .await
-            .expect("snapshot load failed");
-
-        let g = log.lock().await;
-        assert_eq!(loaded_log.total_entries(), g.total_entries());
-
-        for &id in &[501u64, 600, 750, entry_count + 1] {
-            let (orig_id, orig_ts, orig_data) = g.read(id).unwrap();
-            let (loaded_id, loaded_ts, loaded_data) = loaded_log.read(id).unwrap();
-            assert_eq!(orig_id, loaded_id);
-            assert_eq!(orig_ts, loaded_ts);
-            assert_eq!(orig_data, loaded_data);
+        let range = log.read_range(100, 109);
+        assert_eq!(range.len(), 10);
+        for (idx, (id, _, _)) in range.iter().enumerate() {
+            assert_eq!(*id, 100 + idx as u64);
         }
 
-        assert!(loaded_log.read(1).is_err());
-        assert!(loaded_log.read(500).is_err());
-        assert!(loaded_log.read(501).is_ok());
-    }
+        log.trim(501);
+        assert_eq!(log.total_entries(), 500);
+        assert!(log.read(1).is_err());
+        assert!(log.read(500).is_err());
+        assert!(log.read(501).is_ok());
 
-    #[tokio::test]
-    async fn test_periodic_snapshot_fires() {
-        let log = Arc::new(Mutex::new(SegLog::new("test_periodic".to_string())));
-        SegLog::start_periodic_snapshot(Arc::clone(&log), Duration::from_millis(200));
-
-        {
-            let mut g = log.lock().await;
-            for i in 0..100u64 {
-                g.append(i, b"periodic-test").await.unwrap();
-            }
-        }
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        let mut reloaded = SegLog::new("test_periodic".to_string());
-        reloaded.load_snapshot().await.expect("load failed");
-        assert_eq!(reloaded.total_entries(), 100);
+        let new_id = log.append(9999999999999, b"post-trim-event").await.unwrap();
+        assert_eq!(new_id, entry_count + 1);
+        let (_, _, data) = log.read(new_id).unwrap();
+        assert_eq!(data, b"post-trim-event");
     }
 
     #[tokio::test]
     async fn test_segment_boundary_integrity() {
-        let log = Arc::new(Mutex::new(SegLog::new("test_group".to_string())));
-        SegLog::start_periodic_snapshot(Arc::clone(&log), Duration::from_secs(60));
-
+        let mut log = SegLog::new();
         let payload_size = 1000;
         let count = 500u64;
-        let mut g = log.lock().await;
 
         for i in 0..count {
             let fill_byte = (i & 0xFF) as u8;
             let payload = vec![fill_byte; payload_size];
-            g.append(i, &payload).await.unwrap();
+            log.append(i, &payload).await.unwrap();
         }
 
-        assert!(g.total_segments() > 1);
+        assert!(log.total_segments() > 1);
 
         for id in 1..=count {
-            let (_, ts, data) = g.read(id).unwrap();
+            let (_, ts, data) = log.read(id).unwrap();
             let i = id - 1;
             assert_eq!(ts, i);
             assert_eq!(data.len(), payload_size);
@@ -601,7 +305,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wire_format_and_zero_copy() {
-        let mut log = SegLog::new("test_group".to_string());
+        let mut log = SegLog::new();
         let ts: u64 = 0xAABB_CCDD_1122_3344;
         let payload = b"wire-fmt";
         let id = log.append(ts, payload).await.unwrap();
@@ -624,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_edge_cases() {
-        let mut log = SegLog::new("test_group".to_string());
+        let mut log = SegLog::new();
 
         let id1 = log.append(0, b"").await.unwrap();
         let (_, _, d) = log.read(id1).unwrap();
@@ -647,9 +351,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_safety() {
-        drop(SegLog::new("test_group".to_string()));
+        drop(SegLog::new());
 
-        let mut log = SegLog::new("test_group".to_string());
+        let mut log = SegLog::new();
         for _ in 0..300 {
             log.append(1, &vec![0u8; 2000]).await.unwrap();
         }
@@ -678,18 +382,13 @@ mod bench {
         const LARGE_PAYLOAD: usize = 4096;
 
         let mut rng: u64 = 0xDEAD_BEEF_CAFE_1234;
-
-        let log = Arc::new(Mutex::new(SegLog::new("bench_log".to_string())));
-        SegLog::start_periodic_snapshot(Arc::clone(&log), SNAPSHOT_INTERVAL);
+        let mut log = SegLog::new();
 
         let payload = vec![0xABu8; SMALL_PAYLOAD];
         let t = Instant::now();
-        {
-            let mut g = log.lock().await;
-            for i in 0..TOTAL_OPS / 2 {
-                let ts = 1_700_000_000_000 + i * 10;
-                g.append(ts, &payload).await.unwrap();
-            }
+        for i in 0..TOTAL_OPS / 2 {
+            let ts = 1_700_000_000_000 + i * 10;
+            log.append(ts, &payload).await.unwrap();
         }
         let half = TOTAL_OPS / 2;
         let elapsed = t.elapsed();
@@ -698,18 +397,15 @@ mod bench {
             half,
             elapsed.as_secs_f64() * 1000.0,
             half as f64 / elapsed.as_secs_f64(),
-            log.lock().await.total_segments()
+            log.total_segments()
         );
 
         let large_payload = vec![0xCDu8; LARGE_PAYLOAD];
         let t = Instant::now();
         let mut large_ids = Vec::new();
-        {
-            let mut g = log.lock().await;
-            for i in 0..1000u64 {
-                let id = g.append(9_000_000 + i, &large_payload).await.unwrap();
-                large_ids.push(id);
-            }
+        for i in 0..1000u64 {
+            let id = log.append(9_000_000 + i, &large_payload).await.unwrap();
+            large_ids.push(id);
         }
         let elapsed = t.elapsed();
         println!(
@@ -717,19 +413,16 @@ mod bench {
             LARGE_PAYLOAD / 1024,
             elapsed.as_secs_f64() * 1000.0,
             1000.0 / elapsed.as_secs_f64(),
-            log.lock().await.total_segments()
+            log.total_segments()
         );
 
-        let max_id = log.lock().await.next_id() - 1;
+        let max_id = log.next_id() - 1;
         let t = Instant::now();
         let mut hits = 0u64;
-        {
-            let g = log.lock().await;
-            for _ in 0..100_000 {
-                let id = (xorshift64(&mut rng) % max_id) + 1;
-                if g.read(id).is_ok() {
-                    hits += 1;
-                }
+        for _ in 0..100_000 {
+            let id = (xorshift64(&mut rng) % max_id) + 1;
+            if log.read(id).is_ok() {
+                hits += 1;
             }
         }
         let elapsed = t.elapsed();
@@ -740,35 +433,28 @@ mod bench {
             hits
         );
 
-        let windows = [(1, 100), (100, 500), (1000, 2000), (5000, 5999)];
-        {
-            let g = log.lock().await;
-            for (start, end) in windows {
-                let t = Instant::now();
-                let results = g.read_range(start, end);
-                let elapsed = t.elapsed();
-                println!(
-                    "[read_range] id {}..={} => {} entries in {:.3}ms",
-                    start,
-                    end,
-                    results.len(),
-                    elapsed.as_secs_f64() * 1000.0
-                );
-            }
+        for (start, end) in [(1, 100), (100, 500), (1000, 2000), (5000, 5999)] {
+            let t = Instant::now();
+            let results = log.read_range(start, end);
+            let elapsed = t.elapsed();
+            println!(
+                "[read_range] id {}..={} => {} entries in {:.3}ms",
+                start,
+                end,
+                results.len(),
+                elapsed.as_secs_f64() * 1000.0
+            );
         }
 
         let mut key_last_id: Vec<u64> = vec![0; NUM_KEYS as usize];
         let t = Instant::now();
-        {
-            let mut g = log.lock().await;
-            for _ in 0..TOTAL_OPS / 2 {
-                let key = xorshift64(&mut rng) % NUM_KEYS;
-                let ts = xorshift64(&mut rng);
-                let size = (xorshift64(&mut rng) % 512 + 32) as usize;
-                let payload = vec![(key & 0xFF) as u8; size];
-                let id = g.append(ts, &payload).await.unwrap();
-                key_last_id[key as usize] = id;
-            }
+        for _ in 0..TOTAL_OPS / 2 {
+            let key = xorshift64(&mut rng) % NUM_KEYS;
+            let ts = xorshift64(&mut rng);
+            let size = (xorshift64(&mut rng) % 512 + 32) as usize;
+            let payload = vec![(key & 0xFF) as u8; size];
+            let id = log.append(ts, &payload).await.unwrap();
+            key_last_id[key as usize] = id;
         }
         let elapsed = t.elapsed();
         let ops = TOTAL_OPS / 2;
@@ -778,92 +464,52 @@ mod bench {
             NUM_KEYS,
             elapsed.as_secs_f64() * 1000.0,
             ops as f64 / elapsed.as_secs_f64(),
-            log.lock().await.total_segments()
+            log.total_segments()
         );
 
-        {
-            let g = log.lock().await;
-            let mut verified = 0;
-            for (key, &id) in key_last_id.iter().enumerate() {
-                if id == 0 {
-                    continue;
-                }
-                let (read_id, _, data) = g.read(id).unwrap();
-                assert_eq!(read_id, id);
-                assert_eq!(data[0], (key & 0xFF) as u8);
-                verified += 1;
+        let mut verified = 0;
+        for (key, &id) in key_last_id.iter().enumerate() {
+            if id == 0 {
+                continue;
             }
-            println!("[verify] {}/{} keys verified", verified, NUM_KEYS);
+            let (read_id, _, data) = log.read(id).unwrap();
+            assert_eq!(read_id, id);
+            assert_eq!(data[0], (key & 0xFF) as u8);
+            verified += 1;
         }
+        println!("[verify] {}/{} keys verified", verified, NUM_KEYS);
 
         let cutoff = max_id / 2;
-        let (before, trimmed_len, after) = {
-            let mut g = log.lock().await;
-            let before = g.total_entries();
-            let t = Instant::now();
-            let trimmed = g.trim(cutoff);
-            let elapsed = t.elapsed();
-            let after = g.total_entries();
-            println!(
-                "[trim] cutoff={} | removed {} entries in {:.3}ms | entries: {} -> {}",
-                cutoff,
-                trimmed.len(),
-                elapsed.as_secs_f64() * 1000.0,
-                before,
-                after
-            );
-            (before, trimmed.len(), after)
-        };
-        let _ = (before, trimmed_len, after);
-
-        {
-            let g = log.lock().await;
-            assert!(g.read(1).is_err());
-            assert!(g.read(cutoff).is_ok());
-        }
-
-        let id_post = {
-            let mut g = log.lock().await;
-            let pre_trim_next = g.next_id();
-            let id_post = g.append(u64::MAX, b"post-trim").await.unwrap();
-            assert_eq!(id_post, pre_trim_next);
-            let (_, ts, data) = g.read(id_post).unwrap();
-            assert_eq!(ts, u64::MAX);
-            assert_eq!(data, b"post-trim");
-            println!("[post-trim-append] id={} ok", id_post);
-            id_post
-        };
-
-        let entries_before_snap = log.lock().await.total_entries();
+        let before = log.total_entries();
         let t = Instant::now();
-        log.lock().await.snapshot().await.expect("snapshot failed");
-        let snap_time = t.elapsed();
-
-        let mut reloaded = SegLog::new("bench_log".to_string());
-        let t = Instant::now();
-        reloaded
-            .load_snapshot()
-            .await
-            .expect("load_snapshot failed");
-        let load_time = t.elapsed();
-
-        assert_eq!(reloaded.total_entries(), entries_before_snap);
-        let (_, _, d) = reloaded.read(id_post).unwrap();
-        assert_eq!(d, b"post-trim");
-
+        let trimmed = log.trim(cutoff);
+        let elapsed = t.elapsed();
+        let after = log.total_entries();
         println!(
-            "[snapshot] {} entries | save: {:.2}ms | load: {:.2}ms",
-            entries_before_snap,
-            snap_time.as_secs_f64() * 1000.0,
-            load_time.as_secs_f64() * 1000.0
+            "[trim] cutoff={} | removed {} entries in {:.3}ms | entries: {} -> {}",
+            cutoff,
+            trimmed.len(),
+            elapsed.as_secs_f64() * 1000.0,
+            before,
+            after
         );
 
-        let g = log.lock().await;
+        assert!(log.read(1).is_err());
+        assert!(log.read(cutoff).is_ok());
+
+        let pre_trim_next = log.next_id();
+        let id_post = log.append(u64::MAX, b"post-trim").await.unwrap();
+        assert_eq!(id_post, pre_trim_next);
+        let (_, ts, data) = log.read(id_post).unwrap();
+        assert_eq!(ts, u64::MAX);
+        assert_eq!(data, b"post-trim");
+        println!("[post-trim-append] id={} ok", id_post);
+
         println!(
             "[final] segments: {} | entries: {} | next_id: {}",
-            g.total_segments(),
-            g.total_entries(),
-            g.next_id()
+            log.total_segments(),
+            log.total_entries(),
+            log.next_id()
         );
     }
 }

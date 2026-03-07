@@ -1,8 +1,9 @@
 use anyhow::anyhow;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::RwLock;
 
 use crate::db::{
+    aof::{AofEntry, AofWriter, load_aof},
     groups::{GroupError, GroupManager, GroupStats},
     kv::{DBEntry, KvStore},
     seg_list::{ListError, SegList},
@@ -12,16 +13,104 @@ pub struct DB {
     group_manager: Arc<RwLock<GroupManager>>,
     kv_store: Arc<RwLock<KvStore>>,
     list: Arc<RwLock<SegList>>,
+    aof: AofWriter,
+    aof_path: PathBuf,
 }
 
 impl DB {
     pub async fn new() -> Self {
-        DB {
-            group_manager: Arc::new(RwLock::new(GroupManager::new().await)),
-            kv_store: Arc::new(RwLock::new(KvStore::new(None).await)),
+        let aof_path = PathBuf::from("aof/log.aof");
+        let aof = AofWriter::new(aof_path.clone());
+        let mut db = DB {
+            group_manager: Arc::new(RwLock::new(GroupManager::new())),
+            kv_store: Arc::new(RwLock::new(KvStore::new(None))),
             list: Arc::new(RwLock::new(SegList::new().await)),
+            aof,
+            aof_path,
+        };
+        db.load_and_apply().await.expect("failed to load aof");
+        db
+    }
+
+    pub async fn load_and_apply(&mut self) -> anyhow::Result<()> {
+        let entries = load_aof(&self.aof_path).await?;
+        println!("[AOF] replaying {} entries...", entries.len());
+        for entry in entries {
+            self.apply(entry).await;
+        }
+        println!("[AOF] replay done");
+        Ok(())
+    }
+
+    async fn apply(&mut self, entry: AofEntry) {
+        match entry {
+            AofEntry::KvSet { db, key, val, ttl } => {
+                let _ = self.kv_store.write().await.set(db, key, val, ttl);
+            }
+            AofEntry::KvDel { db, key } => {
+                let _ = self.kv_store.write().await.del(db, key);
+            }
+            AofEntry::KvFlush { db } => {
+                let _ = self.kv_store.write().await.flush(db);
+            }
+            AofEntry::LogCreateGroup { name } => {
+                let _ = self.group_manager.write().await.create_group(&name).await;
+            }
+            AofEntry::LogDropGroup { name } => {
+                let _ = self.group_manager.write().await.drop_group(&name).await;
+            }
+            AofEntry::LogAdd {
+                group,
+                timestamp,
+                payload,
+            } => {
+                let _ = self
+                    .group_manager
+                    .write()
+                    .await
+                    .add(&group, timestamp, &payload)
+                    .await;
+            }
+            AofEntry::LogAddRange { group, entries } => {
+                let owned: Vec<(u64, Vec<u8>)> = entries;
+                let refs: Vec<(u64, &[u8])> =
+                    owned.iter().map(|(ts, d)| (*ts, d.as_slice())).collect();
+                let _ = self
+                    .group_manager
+                    .write()
+                    .await
+                    .add_range(&group, &refs)
+                    .await;
+            }
+            AofEntry::LogRemove { group, up_to_id } => {
+                let _ = self
+                    .group_manager
+                    .write()
+                    .await
+                    .remove(&group, up_to_id)
+                    .await;
+            }
+            AofEntry::ListPush { key, payload } => {
+                let _ = self.list.write().await.push(key, payload).await;
+            }
+            AofEntry::ListPushRange { key, items } => {
+                let _ = self.list.write().await.push_range(key, items).await;
+            }
+            AofEntry::ListPop { key } => {
+                let _ = self.list.write().await.pop(key).await;
+            }
+            AofEntry::ListPopRange { key, start, end } => {
+                let _ = self.list.write().await.pop_range(key, start, end).await;
+            }
+            AofEntry::ListPopCount { key, count } => {
+                let _ = self.list.write().await.pop_count(key, count).await;
+            }
+            AofEntry::ListFlush { key } => {
+                let _ = self.list.write().await.flush(key).await;
+            }
         }
     }
+
     pub async fn kv_set(
         &mut self,
         db: String,
@@ -29,183 +118,259 @@ impl DB {
         val: Vec<u8>,
         ttl: i64,
     ) -> Result<(), DBError> {
-        match self.kv_store.write().await.set(db, key, val, ttl).await {
-            Ok(_) => Ok(()),
-            Err(err) => Err(DBError::KVSetError(err)),
-        }
+        self.kv_store
+            .write()
+            .await
+            .set(db.clone(), key.clone(), val.clone(), ttl)
+            .map_err(DBError::KVSetError)?;
+        self.aof.write(AofEntry::KvSet { db, key, val, ttl });
+        Ok(())
     }
+
     pub async fn kv_get(&mut self, db: String, key: String) -> Result<Option<DBEntry>, DBError> {
-        match self.kv_store.write().await.get(db, key).await {
-            Ok(entry) => Ok(entry),
-            Err(err) => Err(DBError::KVSetError(err)),
-        }
+        self.kv_store
+            .write()
+            .await
+            .get(db, key)
+            .map_err(DBError::KVGetError)
     }
+
     pub async fn kv_del(&mut self, db: String, key: String) -> Result<(), DBError> {
-        match self.kv_store.write().await.del(db, key).await {
-            Ok(_) => Ok(()),
-            Err(err) => Err(DBError::KVSetError(err)),
-        }
+        self.kv_store
+            .write()
+            .await
+            .del(db.clone(), key.clone())
+            .map_err(DBError::KVDelError)?;
+        self.aof.write(AofEntry::KvDel { db, key });
+        Ok(())
     }
+
     pub async fn kv_keys(&mut self, db: String) -> Result<Vec<String>, DBError> {
-        match self.kv_store.write().await.keys(db).await {
-            Ok(keys) => Ok(keys),
-            Err(err) => Err(DBError::KVSetError(err)),
-        }
+        self.kv_store
+            .write()
+            .await
+            .keys(db)
+            .map_err(DBError::KVKeysError)
     }
+
     pub async fn kv_flush(&mut self, db: String) -> Result<(), DBError> {
-        match self.kv_store.write().await.flush(db).await {
-            Ok(_) => Ok(()),
-            Err(err) => Err(DBError::KVSetError(err)),
-        }
+        self.kv_store
+            .write()
+            .await
+            .flush(db.clone())
+            .map_err(DBError::KVFlushError)?;
+        self.aof.write(AofEntry::KvFlush { db });
+        Ok(())
     }
 
     pub async fn log_create_group(&mut self, name: &str) -> Result<(), DBError> {
-        match self.group_manager.write().await.create_group(name).await {
-            Ok(_) => Ok(()),
-            Err(err) => Err(DBError::LogCreateGroupError(err)),
-        }
+        self.group_manager
+            .write()
+            .await
+            .create_group(name)
+            .await
+            .map_err(DBError::LogCreateGroupError)?;
+        self.aof.write(AofEntry::LogCreateGroup {
+            name: name.to_string(),
+        });
+        Ok(())
     }
+
     pub async fn log_drop_group(&mut self, name: &str) -> Result<(), DBError> {
-        match self.group_manager.write().await.drop_group(name).await {
-            Ok(_) => Ok(()),
-            Err(err) => Err(DBError::LogDropGroupError(err)),
-        }
+        self.group_manager
+            .write()
+            .await
+            .drop_group(name)
+            .await
+            .map_err(DBError::LogDropGroupError)?;
+        self.aof.write(AofEntry::LogDropGroup {
+            name: name.to_string(),
+        });
+        Ok(())
     }
+
     pub async fn log_add(
         &mut self,
         group: &str,
         timestamp: u64,
         payload: &[u8],
     ) -> Result<u64, DBError> {
-        match self
+        let id = self
             .group_manager
             .write()
             .await
             .add(group, timestamp, payload)
             .await
-        {
-            Ok(id) => Ok(id),
-            Err(err) => Err(DBError::LogAppendError(err)),
-        }
+            .map_err(DBError::LogAppendError)?;
+        self.aof.write(AofEntry::LogAdd {
+            group: group.to_string(),
+            timestamp,
+            payload: payload.to_vec(),
+        });
+        Ok(id)
     }
+
     pub async fn log_add_range(
         &mut self,
         group: &str,
         entries: &[(u64, &[u8])],
     ) -> Result<(u64, u64), DBError> {
-        match self
+        let result = self
             .group_manager
             .write()
             .await
             .add_range(group, entries)
             .await
-        {
-            Ok((first, last)) => Ok((first, last)),
-            Err(err) => Err(DBError::LogAppendRangeError(err)),
-        }
+            .map_err(DBError::LogAppendRangeError)?;
+        self.aof.write(AofEntry::LogAddRange {
+            group: group.to_string(),
+            entries: entries.iter().map(|(ts, d)| (*ts, d.to_vec())).collect(),
+        });
+        Ok(result)
     }
+
     pub async fn log_read(&mut self, group: &str, id: u64) -> Result<(u64, u64, Vec<u8>), DBError> {
-        match self.group_manager.write().await.read(group, id).await {
-            Ok((id, ts, data)) => Ok((id, ts, data)),
-            Err(err) => Err(DBError::LogReadError(err)),
-        }
+        self.group_manager
+            .write()
+            .await
+            .read(group, id)
+            .await
+            .map_err(DBError::LogReadError)
     }
+
     pub async fn log_read_range(
         &mut self,
         group: &str,
         start: u64,
         end: u64,
     ) -> Result<Vec<(u64, u64, Vec<u8>)>, DBError> {
-        match self
-            .group_manager
+        self.group_manager
             .write()
             .await
             .read_range(group, start, end)
             .await
-        {
-            Ok((data)) => Ok(data),
-            Err(err) => Err(DBError::LogReadRangeError(err)),
-        }
+            .map_err(DBError::LogReadRangeError)
     }
+
     pub async fn log_remove(&mut self, group: &str, up_to_id: u64) -> Result<(), DBError> {
-        match self
-            .group_manager
+        self.group_manager
             .write()
             .await
             .remove(group, up_to_id)
             .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => Err(DBError::LogRemoveError(err)),
-        }
+            .map_err(DBError::LogRemoveError)?;
+        self.aof.write(AofEntry::LogRemove {
+            group: group.to_string(),
+            up_to_id,
+        });
+        Ok(())
     }
+
     pub async fn log_list_groups(&mut self) -> Result<Vec<String>, DBError> {
         Ok(self.group_manager.read().await.list_groups())
     }
 
     pub async fn log_group_stats(&mut self, group: &str) -> Result<GroupStats, DBError> {
-        match self.group_manager.write().await.group_stats(group).await {
-            Ok(stats) => Ok(stats),
-            Err(err) => Err(DBError::LogGroupStatsError(err)),
-        }
+        self.group_manager
+            .write()
+            .await
+            .group_stats(group)
+            .await
+            .map_err(DBError::LogGroupStatsError)
     }
 
     pub async fn list_push(&mut self, key: String, payload: Vec<u8>) -> Result<(), DBError> {
-        match self.list.write().await.push(key, payload).await {
-            Ok(_) => Ok(()),
-            Err(err) => Err(DBError::ListPushError(err)),
-        }
+        self.list
+            .write()
+            .await
+            .push(key.clone(), payload.clone())
+            .await
+            .map_err(DBError::ListPushError)?;
+        self.aof.write(AofEntry::ListPush { key, payload });
+        Ok(())
     }
+
     pub async fn list_push_range(
         &mut self,
         key: String,
         items: Vec<Vec<u8>>,
     ) -> Result<(), DBError> {
-        match self.list.write().await.push_range(key, items).await {
-            Ok(_) => todo!(),
-            Err(err) => Err(DBError::ListPushRangeError(err)),
-        }
+        self.list
+            .write()
+            .await
+            .push_range(key.clone(), items.clone())
+            .await
+            .map_err(DBError::ListPushRangeError)?;
+        self.aof.write(AofEntry::ListPushRange { key, items });
+        Ok(())
     }
+
     pub async fn list_pop(&mut self, key: String) -> Result<Vec<u8>, DBError> {
-        match self.list.write().await.pop(key).await {
-            Ok(data) => Ok(data),
-            Err(err) => Err(DBError::ListPopError(err)),
-        }
+        let data = self
+            .list
+            .write()
+            .await
+            .pop(key.clone())
+            .await
+            .map_err(DBError::ListPopError)?;
+        self.aof.write(AofEntry::ListPop { key });
+        Ok(data)
     }
+
     pub async fn list_pop_range(
         &mut self,
         key: String,
         start: usize,
         end: usize,
     ) -> Result<Vec<Vec<u8>>, DBError> {
-        match self.list.write().await.pop_range(key, start, end).await {
-            Ok(data) => Ok(data),
-            Err(err) => Err(DBError::ListPopRangeError(err)),
-        }
+        let data = self
+            .list
+            .write()
+            .await
+            .pop_range(key.clone(), start, end)
+            .await
+            .map_err(DBError::ListPopRangeError)?;
+        self.aof.write(AofEntry::ListPopRange { key, start, end });
+        Ok(data)
     }
+
     pub async fn list_pop_count(
         &mut self,
         key: String,
         count: usize,
     ) -> Result<Vec<Vec<u8>>, DBError> {
-        match self.list.write().await.pop_count(key, count).await {
-            Ok(data) => Ok(data),
-            Err(err) => Err(DBError::ListPopCountError(err)),
-        }
+        let data = self
+            .list
+            .write()
+            .await
+            .pop_count(key.clone(), count)
+            .await
+            .map_err(DBError::ListPopCountError)?;
+        self.aof.write(AofEntry::ListPopCount { key, count });
+        Ok(data)
     }
+
     pub async fn list_len(&mut self, key: String) -> Result<usize, DBError> {
-        match self.list.write().await.len(key).await {
-            Ok(len) => Ok(len),
-            Err(err) => Err(DBError::ListLenError(err)),
-        }
+        self.list
+            .write()
+            .await
+            .len(key)
+            .await
+            .map_err(DBError::ListLenError)
     }
+
     pub async fn list_flush(&mut self, key: String) -> Result<(), DBError> {
-        match self.list.write().await.flush(key).await {
-            Ok(len) => Ok(len),
-            Err(err) => Err(DBError::ListFlushError(err)),
-        }
+        self.list
+            .write()
+            .await
+            .flush(key.clone())
+            .await
+            .map_err(DBError::ListFlushError)?;
+        self.aof.write(AofEntry::ListFlush { key });
+        Ok(())
     }
 }
+
 #[derive(Debug)]
 pub enum DBError {
     LogCreateGroupError(GroupError),
@@ -217,20 +382,11 @@ pub enum DBError {
     LogRemoveError(GroupError),
     LogListGroupsError(GroupError),
     LogGroupStatsError(GroupError),
-
     KVSetError(anyhow::Error),
     KVGetError(anyhow::Error),
     KVDelError(anyhow::Error),
     KVKeysError(anyhow::Error),
     KVFlushError(anyhow::Error),
-
-    // list_push
-    // list_push_range
-    // list_pop
-    // list_pop_range
-    // list_pop_count
-    // list_len
-    // list_flush
     ListPushError(ListError),
     ListPushRangeError(ListError),
     ListPopError(ListError),
@@ -243,61 +399,27 @@ pub enum DBError {
 impl std::fmt::Display for DBError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DBError::LogCreateGroupError(err) => {
-                write!(f, "failed to create group: {}", err.to_string())
-            }
-            DBError::LogDropGroupError(err) => {
-                write!(f, "failed to drop group: {}", err.to_string())
-            }
-            DBError::LogAppendError(err) => {
-                write!(f, "failed to append to log: {}", err.to_string())
-            }
-            DBError::LogAppendRangeError(err) => {
-                write!(
-                    f,
-                    "failed to append range of entities to log: {}",
-                    err.to_string()
-                )
-            }
-            DBError::LogReadError(err) => {
-                write!(f, "failed to read id from log: {}", err.to_string())
-            }
-            DBError::LogReadRangeError(err) => {
-                write!(f, "failed to read id from log: {}", err.to_string())
-            }
-            DBError::LogRemoveError(err) => {
-                write!(f, "failed to remove id from log: {}", err.to_string())
-            }
-            DBError::LogListGroupsError(err) => {
-                write!(f, "failed to list groups: {}", err.to_string())
-            }
-            DBError::LogGroupStatsError(err) => {
-                write!(f, "failed to read group stats: {}", err.to_string())
-            }
-            DBError::KVSetError(err) => writeln!(f, "failed to set key: {}", err.to_string()),
-            DBError::KVGetError(err) => writeln!(f, "failed to get key: {}", err.to_string()),
-            DBError::KVDelError(err) => writeln!(f, "failed to del key: {}", err.to_string()),
-            DBError::KVKeysError(err) => writeln!(f, "failed to return keys: {}", err.to_string()),
-            DBError::KVFlushError(err) => writeln!(f, "failed to flush keys: {}", err.to_string()),
-            DBError::ListPushError(err) => write!(f, "failed to push: {}", err.to_string()),
-            DBError::ListPushRangeError(err) => {
-                write!(f, "failed to push range: {}", err.to_string())
-            }
-            DBError::ListPopError(err) => write!(f, "failed to pop: {}", err.to_string()),
-            DBError::ListPopRangeError(err) => {
-                write!(f, "failed to pop range: {}", err.to_string())
-            }
-            DBError::ListPopCountError(err) => {
-                write!(f, "failed to pop count: {}", err.to_string())
-            }
-            DBError::ListLenError(err) => write!(f, "failed to count len: {}", err.to_string()),
-            DBError::ListFlushError(err) => write!(f, "failed to flush list: {}", err.to_string()),
+            DBError::LogCreateGroupError(e) => write!(f, "failed to create group: {}", e),
+            DBError::LogDropGroupError(e) => write!(f, "failed to drop group: {}", e),
+            DBError::LogAppendError(e) => write!(f, "failed to append to log: {}", e),
+            DBError::LogAppendRangeError(e) => write!(f, "failed to append range to log: {}", e),
+            DBError::LogReadError(e) => write!(f, "failed to read from log: {}", e),
+            DBError::LogReadRangeError(e) => write!(f, "failed to read range from log: {}", e),
+            DBError::LogRemoveError(e) => write!(f, "failed to remove from log: {}", e),
+            DBError::LogListGroupsError(e) => write!(f, "failed to list groups: {}", e),
+            DBError::LogGroupStatsError(e) => write!(f, "failed to read group stats: {}", e),
+            DBError::KVSetError(e) => write!(f, "failed to set key: {}", e),
+            DBError::KVGetError(e) => write!(f, "failed to get key: {}", e),
+            DBError::KVDelError(e) => write!(f, "failed to del key: {}", e),
+            DBError::KVKeysError(e) => write!(f, "failed to return keys: {}", e),
+            DBError::KVFlushError(e) => write!(f, "failed to flush: {}", e),
+            DBError::ListPushError(e) => write!(f, "failed to push: {}", e),
+            DBError::ListPushRangeError(e) => write!(f, "failed to push range: {}", e),
+            DBError::ListPopError(e) => write!(f, "failed to pop: {}", e),
+            DBError::ListPopRangeError(e) => write!(f, "failed to pop range: {}", e),
+            DBError::ListPopCountError(e) => write!(f, "failed to pop count: {}", e),
+            DBError::ListLenError(e) => write!(f, "failed to get len: {}", e),
+            DBError::ListFlushError(e) => write!(f, "failed to flush list: {}", e),
         }
     }
-}
-
-struct LogReadResult {
-    pub id: u64,
-    pub ts: u64,
-    pub data: Vec<u8>,
 }

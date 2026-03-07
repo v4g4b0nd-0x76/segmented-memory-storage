@@ -1,3 +1,4 @@
+mod aof;
 pub mod db;
 mod groups;
 mod kv;
