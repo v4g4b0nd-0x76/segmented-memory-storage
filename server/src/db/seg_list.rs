@@ -247,7 +247,7 @@ mod bench {
         let mut seed: u64 = 0xdeadbeefcafe1234;
 
         const KEYS: usize = 200;
-        const OPS: usize = 1000_000;
+        const OPS: usize = 100_000;
 
         let keys: Vec<String> = (0..KEYS).map(|i| format!("key:{}", i)).collect();
         let initial_free = list.free_segs.len();

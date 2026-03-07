@@ -1,12 +1,6 @@
-use crate::server::Server;
+use crate::server::server::Server;
 
-mod codec;
-mod groups;
-mod kv;
-mod lru;
-mod proto;
-mod seg_list;
-mod seg_log;
+mod db;
 mod server;
 #[tokio::main]
 async fn main() {

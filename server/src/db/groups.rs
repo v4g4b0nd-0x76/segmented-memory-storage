@@ -1,10 +1,8 @@
-use crate::{
-    lru::{LRU, build_key},
-    seg_log::{LogEntry, LogError, SegLog},
-};
 use futures::TryFutureExt;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{fs::File, sync::Mutex};
+
+use crate::db::{lru::*, seg_log::*};
 
 #[derive(Debug)]
 pub enum GroupError {
@@ -209,8 +207,8 @@ impl GroupManager {
         Ok(())
     }
 
-    pub fn list_groups(&self) -> Vec<&str> {
-        self.groups.keys().map(|s| s.as_str()).collect()
+    pub fn list_groups(&self) -> Vec<String> {
+        self.groups.keys().map(|s| s.to_string()).collect()
     }
 
     pub async fn group_stats(&self, group: &str) -> Result<GroupStats, GroupError> {

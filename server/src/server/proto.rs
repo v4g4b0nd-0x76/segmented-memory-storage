@@ -382,7 +382,7 @@ impl ResponseBuilder {
         self.finalize()
     }
 
-    pub fn ok_group_list(&mut self, groups: &[&str]) -> &[u8] {
+    pub fn ok_group_list(&mut self, groups: Vec<String>) -> &[u8] {
         self.buf.clear();
         self.buf.extend_from_slice(&[0u8; 4]);
         self.buf.push(STATUS_OK);

@@ -3,3 +3,4 @@
 **/Cargo.lock
 bins/
 server/snapshots/
+server/aof/
