@@ -455,6 +455,260 @@ pub async fn kv_flush(
     }
 }
 
+pub async fn list_push(
+    State(pool): State<Arc<ClientPool>>,
+    Path(key): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let val = match req.get("val").and_then(|v| v.as_str()) {
+        Some(v) => v.as_bytes().to_vec(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing val"})),
+            )
+                .into_response();
+        }
+    };
+    match conn.conn().l_push(&key, &val).await {
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({"status": "ok"}))).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn list_push_range(
+    State(pool): State<Arc<ClientPool>>,
+    Path(key): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let vals_str: Vec<String> = match req
+        .get("vals")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing vals"})),
+            )
+                .into_response();
+        }
+    };
+    let vals_bytes: Vec<Vec<u8>> = vals_str.iter().map(|s| s.as_bytes().to_vec()).collect();
+    let vals: Vec<&[u8]> = vals_bytes.iter().map(|v| v.as_slice()).collect();
+    match conn.conn().l_push_range(&key, &vals).await {
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({"status": "ok"}))).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn list_pop(
+    State(pool): State<Arc<ClientPool>>,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    match conn.conn().l_pop(&key).await {
+        Ok(Ok(Some(val))) => {
+            let val_str = String::from_utf8_lossy(&val).to_string();
+            (StatusCode::OK, Json(json!({"val": val_str}))).into_response()
+        }
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "list empty or not found"})),
+        )
+            .into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn list_pop_range(
+    State(pool): State<Arc<ClientPool>>,
+    Path(key): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let start = match req.get("start").and_then(|v| v.as_u64()) {
+        Some(v) => v as u32,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing start"})),
+            )
+                .into_response();
+        }
+    };
+    let end = match req.get("end").and_then(|v| v.as_u64()) {
+        Some(v) => v as u32,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing end"})),
+            )
+                .into_response();
+        }
+    };
+    match conn.conn().l_pop_range(&key, start, end).await {
+        Ok(Ok(vals)) => {
+            let decoded: Vec<String> = vals
+                .iter()
+                .map(|v| String::from_utf8_lossy(v).to_string())
+                .collect();
+            (StatusCode::OK, Json(json!({"vals": decoded}))).into_response()
+        }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn list_pop_count(
+    State(pool): State<Arc<ClientPool>>,
+    Path(key): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let count = match req.get("count").and_then(|v| v.as_u64()) {
+        Some(v) => v as u32,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing count"})),
+            )
+                .into_response();
+        }
+    };
+    match conn.conn().l_pop_count(&key, count).await {
+        Ok(Ok(vals)) => {
+            let decoded: Vec<String> = vals
+                .iter()
+                .map(|v| String::from_utf8_lossy(v).to_string())
+                .collect();
+            (StatusCode::OK, Json(json!({"vals": decoded}))).into_response()
+        }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn list_len(
+    State(pool): State<Arc<ClientPool>>,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    match conn.conn().l_len(&key).await {
+        Ok(Ok(len)) => (StatusCode::OK, Json(json!({"len": len}))).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn list_flush(
+    State(pool): State<Arc<ClientPool>>,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    match conn.conn().l_flush(&key).await {
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({"status": "flushed"}))).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({"status": "ok"})))
 }
