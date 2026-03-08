@@ -1,11 +1,14 @@
-use anyhow::anyhow;
-use std::{path::PathBuf, sync::Arc};
-use tokio::sync::RwLock;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tokio::sync::{Mutex, RwLock};
 
 use crate::db::{
     aof::{AofEntry, AofWriter, load_aof},
     groups::{GroupError, GroupManager, GroupStats},
     kv::{DBEntry, KvStore},
+    pipeline::PipelineManager,
     seg_list::{ListError, SegList},
 };
 
@@ -28,6 +31,7 @@ impl DB {
             aof,
             aof_path,
         };
+
         db.load_and_apply().await.expect("failed to load aof");
         db
     }
@@ -39,6 +43,20 @@ impl DB {
             self.apply(entry).await;
         }
         println!("[AOF] replay done");
+        Ok(())
+    }
+
+    pub async fn log_and_apply_path(&mut self, aof_path: &Path) -> anyhow::Result<()> {
+        let entries = load_aof(aof_path).await?;
+        println!(
+            "[{}] replaying {} entries...",
+            aof_path.to_string_lossy(),
+            entries.len()
+        );
+        for entry in entries {
+            self.apply(entry).await;
+        }
+        println!("[{}] replay done", aof_path.to_string_lossy(),);
         Ok(())
     }
 

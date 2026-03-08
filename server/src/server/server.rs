@@ -3,17 +3,31 @@ use std::sync::Arc;
 use tokio::{net::TcpListener, sync::RwLock};
 use tokio_util::codec::Framed;
 
-use crate::{db::db::DB, server::codec::*, server::proto::*};
+use crate::{
+    db::{
+        db::DB,
+        pipeline::{Pipeline, PipelineManager},
+    },
+    server::{codec::*, proto::*},
+};
 
 pub struct Server {
     db: Arc<RwLock<DB>>,
+    pipeline_manager: Arc<RwLock<PipelineManager>>,
 }
 
 impl Server {
     pub async fn new() -> Self {
+        let db = Arc::new(RwLock::new(DB::new().await));
+        let pipeline_manager = Arc::new(RwLock::new(PipelineManager::new(Arc::clone(&db))));
         Server {
-            db: Arc::new(RwLock::new(DB::new().await)),
+            db,
+            pipeline_manager,
         }
+    }
+
+    pub async fn pipeline(&self) -> Pipeline {
+        self.pipeline_manager.read().await.start()
     }
 
     pub async fn start(&self, addr: &str) -> anyhow::Result<()> {
@@ -24,6 +38,7 @@ impl Server {
             socket.set_nodelay(true)?;
             let server = Arc::new(Server {
                 db: Arc::clone(&self.db),
+                pipeline_manager: Arc::clone(&self.pipeline_manager),
             });
             tokio::spawn(async move {
                 let mut framed = Framed::new(socket, LengthPrefixCodec);
@@ -66,16 +81,18 @@ impl Server {
                 group,
                 timestamp,
                 payload,
-            } => match self
-                .db
-                .write()
-                .await
-                .log_add(group, timestamp, payload)
-                .await
-            {
-                Ok(id) => rb.ok_u64(id).to_vec(),
-                Err(e) => rb.err(&e.to_string()).to_vec(),
-            },
+            } => {
+                match self
+                    .db
+                    .write()
+                    .await
+                    .log_add(group, timestamp, payload)
+                    .await
+                {
+                    Ok(id) => rb.ok_u64(id).to_vec(),
+                    Err(e) => rb.err(&e.to_string()).to_vec(),
+                }
+            }
             Command::AddRange { group, entries } => {
                 match self.db.write().await.log_add_range(group, &entries).await {
                     Ok((first, last)) => rb.ok_u64_pair(first, last).to_vec(),
@@ -138,27 +155,31 @@ impl Server {
                     Err(e) => rb.err(&e.to_string()).to_vec(),
                 }
             }
-            Command::GetKey { db, key } => match self
-                .db
-                .write()
-                .await
-                .kv_get(db.to_string(), key.to_string())
-                .await
-            {
-                Ok(Some(entry)) => rb.ok_bytes(&entry.val).to_vec(),
-                Ok(None) => rb.ok_empty().to_vec(),
-                Err(e) => rb.err(&e.to_string()).to_vec(),
-            },
-            Command::DelKey { db, key } => match self
-                .db
-                .write()
-                .await
-                .kv_del(db.to_string(), key.to_string())
-                .await
-            {
-                Ok(()) => rb.ok_empty().to_vec(),
-                Err(e) => rb.err(&e.to_string()).to_vec(),
-            },
+            Command::GetKey { db, key } => {
+                match self
+                    .db
+                    .write()
+                    .await
+                    .kv_get(db.to_string(), key.to_string())
+                    .await
+                {
+                    Ok(Some(entry)) => rb.ok_bytes(&entry.val).to_vec(),
+                    Ok(None) => rb.ok_empty().to_vec(),
+                    Err(e) => rb.err(&e.to_string()).to_vec(),
+                }
+            }
+            Command::DelKey { db, key } => {
+                match self
+                    .db
+                    .write()
+                    .await
+                    .kv_del(db.to_string(), key.to_string())
+                    .await
+                {
+                    Ok(()) => rb.ok_empty().to_vec(),
+                    Err(e) => rb.err(&e.to_string()).to_vec(),
+                }
+            }
             Command::Keys { db } => match self.db.write().await.kv_keys(db.to_string()).await {
                 Ok(keys) => rb.ok_string_list(&keys).to_vec(),
                 Err(e) => rb.err(&e.to_string()).to_vec(),
@@ -167,29 +188,30 @@ impl Server {
                 Ok(()) => rb.ok_empty().to_vec(),
                 Err(e) => rb.err(&e.to_string()).to_vec(),
             },
-            Command::LPush { key, val } => match self
-                .db
-                .write()
-                .await
-                .list_push(key.to_string(), val.to_vec())
-                .await
-            {
-                Ok(_) => rb.ok_empty().to_vec(),
-                Err(e) => rb.err(&e.to_string()).to_vec(),
-            },
+            Command::LPush { key, val } => {
+                match self
+                    .db
+                    .write()
+                    .await
+                    .list_push(key.to_string(), val.to_vec())
+                    .await
+                {
+                    Ok(_) => rb.ok_empty().to_vec(),
+                    Err(e) => rb.err(&e.to_string()).to_vec(),
+                }
+            }
             Command::LPushRange { key, vals } => {
-                if let Err(e) = self
+                match self
                     .db
                     .write()
                     .await
                     .list_push_range(key.to_string(), vals.iter().map(|v| v.to_vec()).collect())
                     .await
                 {
-                    return rb.err(&e.to_string()).to_vec();
+                    Ok(_) => rb.ok_empty().to_vec(),
+                    Err(e) => rb.err(&e.to_string()).to_vec(),
                 }
-                rb.ok_empty().to_vec()
             }
-
             Command::LPop { key } => match self.db.write().await.list_pop(key.to_string()).await {
                 Ok(val) => rb.ok_bytes(&val).to_vec(),
                 Err(e) => rb.err(&e.to_string()).to_vec(),

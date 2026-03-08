@@ -1,16 +1,10 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::path::{Path, PathBuf};
 
-use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::mpsc,
-    time::interval,
 };
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -134,7 +128,7 @@ pub async fn load_aof(path: &Path) -> anyhow::Result<Vec<AofEntry>> {
 }
 #[cfg(test)]
 mod tests {
-    use std::env::temp_dir;
+    use std::{env::temp_dir, time::Duration};
 
     use super::*;
 

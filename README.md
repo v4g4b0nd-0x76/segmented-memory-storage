@@ -21,6 +21,8 @@ Seg List which is like redis stack to push, push_range, pop, pop_count, pop_rang
 there is a wrapper around all data sets that has an aof and apply commands done in that aof in order to recreate data
 the aof file can be used as change log for replica follower catchups
 
+Pipeline: A concurrent command batching system that groups DB operations (KV, List, Log) into atomic jobs, queues them by operation count (shorter jobs run first), and uses a resource-based lock manager to safely execute non-conflicting pipelines in parallel.
+
 ## Client
 
 Custom connection pool for connections to server using its own protocol
