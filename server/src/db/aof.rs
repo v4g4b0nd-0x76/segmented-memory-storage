@@ -67,6 +67,33 @@ pub enum AofEntry {
     },
 }
 
+impl AofEntry {
+    fn category(&self) -> EntryCategory {
+        match self {
+            AofEntry::KvSet { .. } | AofEntry::KvDel { .. } | AofEntry::KvFlush { .. } => {
+                EntryCategory::Kv
+            }
+            AofEntry::LogCreateGroup { .. }
+            | AofEntry::LogDropGroup { .. }
+            | AofEntry::LogAdd { .. }
+            | AofEntry::LogAddRange { .. }
+            | AofEntry::LogRemove { .. } => EntryCategory::Log,
+            AofEntry::ListPush { .. }
+            | AofEntry::ListPushRange { .. }
+            | AofEntry::ListPop { .. }
+            | AofEntry::ListPopRange { .. }
+            | AofEntry::ListPopCount { .. }
+            | AofEntry::ListFlush { .. } => EntryCategory::List,
+        }
+    }
+}
+
+enum EntryCategory {
+    Kv,
+    Log,
+    List,
+}
+
 pub struct AofWriter {
     tx: mpsc::UnboundedSender<AofEntry>,
 }
@@ -103,15 +130,30 @@ async fn aof_worker(path: PathBuf, mut rx: mpsc::UnboundedReceiver<AofEntry>) {
     }
 }
 
-pub async fn load_aof(path: &Path) -> anyhow::Result<Vec<AofEntry>> {
-    if !path.exists() {
-        return Ok(vec![]);
+#[derive(Default)]
+pub struct AofEntries {
+    pub kv_entries: Vec<AofEntry>,
+    pub list_entries: Vec<AofEntry>,
+    pub log_entries: Vec<AofEntry>,
+}
+
+impl AofEntries {
+    pub fn len(&self) -> usize {
+        self.kv_entries.len() + self.list_entries.len() + self.log_entries.len()
     }
 
-    let file = File::open(path).await?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    let mut entries = Vec::new();
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+pub async fn load_aof(path: &Path) -> anyhow::Result<AofEntries> {
+    if !path.exists() {
+        return Ok(AofEntries::default());
+    }
+
+    let mut entries = AofEntries::default();
+    let mut lines = BufReader::new(File::open(path).await?).lines();
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim().to_string();
@@ -119,20 +161,35 @@ pub async fn load_aof(path: &Path) -> anyhow::Result<Vec<AofEntry>> {
             continue;
         }
         match serde_json::from_str::<AofEntry>(&line) {
-            Ok(entry) => entries.push(entry),
+            Ok(entry) => match entry.category() {
+                EntryCategory::Kv => entries.kv_entries.push(entry),
+                EntryCategory::Log => entries.log_entries.push(entry),
+                EntryCategory::List => entries.list_entries.push(entry),
+            },
             Err(e) => eprintln!("[AOF] skipping corrupt line: {}", e),
         }
     }
 
     Ok(entries)
 }
+
 #[cfg(test)]
 mod tests {
-    use std::{env::temp_dir, time::Duration};
-
     use super::*;
-
+    use std::{env::temp_dir, time::Duration};
     use tokio::time::sleep;
+
+    async fn write_and_load(filename: &str, entries: Vec<AofEntry>) -> AofEntries {
+        let path = temp_dir().join(filename);
+        let _ = tokio::fs::remove_file(&path).await;
+        let writer = AofWriter::new(path.clone());
+        for e in entries {
+            writer.write(e);
+        }
+        drop(writer);
+        sleep(Duration::from_millis(100)).await;
+        load_aof(&path).await.unwrap()
+    }
 
     #[tokio::test]
     async fn test_load_nonexistent_file() {
@@ -143,123 +200,170 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_and_load_single_entry() {
-        let dir = temp_dir();
-        let path = dir.join("test_write_and_load_single_entry.aof");
-        let _ = tokio::fs::remove_file(&path).await;
+    async fn test_kv_entries_routed_correctly() {
+        let loaded = write_and_load(
+            "test_kv_routing.aof",
+            vec![
+                AofEntry::KvSet {
+                    db: "d".into(),
+                    key: "k".into(),
+                    val: vec![1],
+                    ttl: 0,
+                },
+                AofEntry::KvDel {
+                    db: "d".into(),
+                    key: "k".into(),
+                },
+                AofEntry::KvFlush { db: "d".into() },
+            ],
+        )
+        .await;
 
-        let writer = AofWriter::new(path.clone());
-        writer.write(AofEntry::KvSet {
-            db: "mydb".into(),
-            key: "foo".into(),
-            val: b"bar".to_vec(),
-            ttl: 0,
-        });
+        assert_eq!(loaded.kv_entries.len(), 3);
+        assert!(loaded.log_entries.is_empty());
+        assert!(loaded.list_entries.is_empty());
 
-        drop(writer);
-        sleep(Duration::from_millis(100)).await;
-
-        let entries = load_aof(&path).await.unwrap();
-        assert_eq!(entries.len(), 1);
-        match &entries[0] {
-            AofEntry::KvSet { db, key, val, ttl } => {
-                assert_eq!(db, "mydb");
-                assert_eq!(key, "foo");
-                assert_eq!(val, b"bar");
-                assert_eq!(*ttl, 0);
-            }
-            _ => panic!("unexpected entry type"),
-        }
+        assert!(
+            matches!(&loaded.kv_entries[0], AofEntry::KvSet { db, key, val, ttl }
+            if db == "d" && key == "k" && val == &[1] && *ttl == 0)
+        );
+        assert!(matches!(&loaded.kv_entries[1], AofEntry::KvDel { db, key }
+            if db == "d" && key == "k"));
+        assert!(matches!(&loaded.kv_entries[2], AofEntry::KvFlush { db } if db == "d"));
     }
 
     #[tokio::test]
-    async fn test_write_and_load_all_variants() {
-        let dir = temp_dir();
-        let path = dir.join("test_write_and_load_all_variants.aof");
-        let _ = tokio::fs::remove_file(&path).await;
+    async fn test_log_entries_routed_correctly() {
+        let loaded = write_and_load(
+            "test_log_routing.aof",
+            vec![
+                AofEntry::LogCreateGroup { name: "g".into() },
+                AofEntry::LogAdd {
+                    group: "g".into(),
+                    timestamp: 1,
+                    payload: vec![9],
+                },
+                AofEntry::LogAddRange {
+                    group: "g".into(),
+                    entries: vec![(1, vec![1]), (2, vec![2])],
+                },
+                AofEntry::LogRemove {
+                    group: "g".into(),
+                    up_to_id: 5,
+                },
+                AofEntry::LogDropGroup { name: "g".into() },
+            ],
+        )
+        .await;
 
-        let writer = AofWriter::new(path.clone());
+        assert_eq!(loaded.log_entries.len(), 5);
+        assert!(loaded.kv_entries.is_empty());
+        assert!(loaded.list_entries.is_empty());
 
-        let entries = vec![
+        assert!(matches!(&loaded.log_entries[0], AofEntry::LogCreateGroup { name } if name == "g"));
+        assert!(
+            matches!(&loaded.log_entries[3], AofEntry::LogRemove { group, up_to_id }
+            if group == "g" && *up_to_id == 5)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_entries_routed_correctly() {
+        let loaded = write_and_load(
+            "test_list_routing.aof",
+            vec![
+                AofEntry::ListPush {
+                    key: "l".into(),
+                    payload: vec![1],
+                },
+                AofEntry::ListPushRange {
+                    key: "l".into(),
+                    items: vec![vec![1], vec![2]],
+                },
+                AofEntry::ListPop { key: "l".into() },
+                AofEntry::ListPopRange {
+                    key: "l".into(),
+                    start: 0,
+                    end: 3,
+                },
+                AofEntry::ListPopCount {
+                    key: "l".into(),
+                    count: 2,
+                },
+                AofEntry::ListFlush { key: "l".into() },
+            ],
+        )
+        .await;
+
+        assert_eq!(loaded.list_entries.len(), 6);
+        assert!(loaded.kv_entries.is_empty());
+        assert!(loaded.log_entries.is_empty());
+
+        assert!(matches!(&loaded.list_entries[2], AofEntry::ListPop { key } if key == "l"));
+        assert!(
+            matches!(&loaded.list_entries[3], AofEntry::ListPopRange { key, start, end }
+            if key == "l" && *start == 0 && *end == 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mixed_entries_total_count() {
+        let all_entries = vec![
             AofEntry::KvSet {
                 db: "d".into(),
                 key: "k".into(),
                 val: vec![1, 2],
                 ttl: 10,
             },
-            AofEntry::KvDel {
-                db: "d".into(),
-                key: "k".into(),
-            },
-            AofEntry::KvFlush { db: "d".into() },
             AofEntry::LogCreateGroup { name: "g1".into() },
-            AofEntry::LogDropGroup { name: "g1".into() },
             AofEntry::LogAdd {
                 group: "g".into(),
                 timestamp: 100,
                 payload: vec![9],
             },
-            AofEntry::LogAddRange {
-                group: "g".into(),
-                entries: vec![(1, vec![1]), (2, vec![2])],
-            },
-            AofEntry::LogRemove {
-                group: "g".into(),
-                up_to_id: 5,
-            },
             AofEntry::ListPush {
                 key: "l".into(),
                 payload: vec![3, 4],
             },
-            AofEntry::ListPushRange {
-                key: "l".into(),
-                items: vec![vec![1], vec![2]],
-            },
             AofEntry::ListPop { key: "l".into() },
-            AofEntry::ListPopRange {
-                key: "l".into(),
-                start: 0,
-                end: 3,
-            },
-            AofEntry::ListPopCount {
-                key: "l".into(),
-                count: 2,
-            },
-            AofEntry::ListFlush { key: "l".into() },
         ];
 
-        for e in &entries {
-            writer.write(e.clone());
-        }
+        let loaded = write_and_load("test_mixed.aof", all_entries).await;
 
-        drop(writer);
-        sleep(Duration::from_millis(100)).await;
-
-        let loaded = load_aof(&path).await.unwrap();
-        assert_eq!(loaded.len(), entries.len());
+        assert_eq!(loaded.kv_entries.len(), 1);
+        assert_eq!(loaded.log_entries.len(), 2);
+        assert_eq!(loaded.list_entries.len(), 2);
+        assert_eq!(loaded.len(), 5);
     }
 
     #[tokio::test]
     async fn test_corrupt_lines_are_skipped() {
-        let dir = temp_dir();
-        let path = dir.join("test_corrupt_lines_are_skipped.aof");
-
+        let path = temp_dir().join("test_corrupt.aof");
         tokio::fs::write(
             &path,
-            b"{\"op\":\"KvFlush\",\"db\":\"x\"}\nNOT_JSON\n{\"op\":\"KvFlush\",\"db\":\"y\"}\n"
-                as &[u8],
+            b"{\"op\":\"KvFlush\",\"db\":\"x\"}\nNOT_JSON\n{\"op\":\"KvFlush\",\"db\":\"y\"}\n",
         )
         .await
         .unwrap();
 
         let entries = load_aof(&path).await.unwrap();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.kv_entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_empty_lines_are_skipped() {
+        let path = temp_dir().join("test_empty_lines.aof");
+        tokio::fs::write(&path, b"\n\n{\"op\":\"KvFlush\",\"db\":\"x\"}\n\n")
+            .await
+            .unwrap();
+
+        let entries = load_aof(&path).await.unwrap();
+        assert_eq!(entries.kv_entries.len(), 1);
     }
 
     #[tokio::test]
     async fn test_multiple_writers_append() {
-        let dir = temp_dir();
-        let path = dir.join("test_multiple_writers_append.aof");
+        let path = temp_dir().join("test_multiple_writers.aof");
         let _ = tokio::fs::remove_file(&path).await;
 
         for i in 0..3u32 {
@@ -275,19 +379,6 @@ mod tests {
         }
 
         let entries = load_aof(&path).await.unwrap();
-        assert_eq!(entries.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn test_empty_lines_are_skipped() {
-        let dir = temp_dir();
-        let path = dir.join("test_empty_lines_are_skipped.aof");
-
-        tokio::fs::write(&path, b"\n\n{\"op\":\"KvFlush\",\"db\":\"x\"}\n\n")
-            .await
-            .unwrap();
-
-        let entries = load_aof(&path).await.unwrap();
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.kv_entries.len(), 3);
     }
 }

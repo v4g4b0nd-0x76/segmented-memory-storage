@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{Notify, RwLock, mpsc};
 
 use crate::db::db::{DB, DBError};
@@ -72,14 +72,17 @@ impl std::fmt::Display for PipelineError {
     }
 }
 
+#[derive(Debug)]
 pub struct Pipeline {
+    pub id: u64,
     commands: Vec<PipelineCommand>,
     tx: mpsc::Sender<PipelineJob>,
 }
 
 impl Pipeline {
-    fn new(tx: mpsc::Sender<PipelineJob>) -> Self {
+    fn new(id: u64, tx: mpsc::Sender<PipelineJob>) -> Self {
         Pipeline {
+            id,
             commands: Vec::new(),
             tx,
         }
@@ -166,7 +169,6 @@ impl LockState {
                 _ => {}
             }
         }
-        // Two pipelines conflict if they share ANY resource
         for r in resources {
             match r {
                 Resource::Kv => {
@@ -279,7 +281,6 @@ impl LockManager {
         self.notify.notify_waiters();
     }
 
-    // Tries to pop the next runnable job from the sorted queue
     pub async fn try_pop_runnable(&self) -> Option<(PipelineJob, Vec<Resource>)> {
         let state = self.state.read().await;
         let mut q = self.queue.write().await;
@@ -292,6 +293,8 @@ impl LockManager {
 
 pub struct PipelineManager {
     tx: mpsc::Sender<PipelineJob>,
+    pipelines: BTreeMap<u64, Arc<Mutex<Pipeline>>>,
+    next_id: u64,
 }
 
 impl PipelineManager {
@@ -304,12 +307,9 @@ impl PipelineManager {
                 let lm = Arc::clone(&lock_manager);
                 let db = Arc::clone(&db);
 
-                // Enqueue into priority queue
                 lm.enqueue(job).await;
 
-                // Drain runnable jobs
                 loop {
-                    // Also drain any additional jobs already in channel (non-blocking)
                     while let Ok(extra) = rx.try_recv() {
                         lm.enqueue(extra).await;
                     }
@@ -332,11 +332,32 @@ impl PipelineManager {
             }
         });
 
-        PipelineManager { tx }
+        PipelineManager {
+            tx,
+            pipelines: BTreeMap::new(),
+            next_id: 0,
+        }
     }
 
-    pub fn start(&self) -> Pipeline {
-        Pipeline::new(self.tx.clone())
+    pub fn start(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let pipeline = Arc::new(Mutex::new(Pipeline::new(id, self.tx.clone())));
+        self.pipelines.insert(id, pipeline);
+        id
+    }
+
+    pub fn get(&self, id: u64) -> Option<Arc<Mutex<Pipeline>>> {
+        self.pipelines.get(&id).cloned()
+    }
+
+    pub fn take(&mut self, id: u64) -> Option<Pipeline> {
+        let arc = self.pipelines.remove(&id)?;
+        Arc::try_unwrap(arc).ok().map(|m| m.into_inner().unwrap())
+    }
+
+    pub fn remove(&mut self, id: u64) {
+        self.pipelines.remove(&id);
     }
 }
 
@@ -389,10 +410,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_kv_set() {
-        let (manager, db) = make_manager().await;
-        let mut p = manager.start();
-        p.kv_set("default".into(), "k1".into(), b"v1".to_vec(), 0);
-        p.end().await.unwrap();
+        let (mut manager, db) = make_manager().await;
+        let id = manager.start();
+        manager.get(id).unwrap().lock().unwrap().kv_set(
+            "default".into(),
+            "k1".into(),
+            b"v1".to_vec(),
+            0,
+        );
+        manager.take(id).unwrap().end().await.unwrap();
 
         let val = db
             .write()
@@ -405,22 +431,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_kv_and_list() {
-        let (manager, db) = make_manager().await;
-        let manager = Arc::new(manager);
+        let (mut manager, db) = make_manager().await;
+        let manager = Arc::new(Mutex::new(manager));
 
         let m1 = Arc::clone(&manager);
         let m2 = Arc::clone(&manager);
 
         let h1 = tokio::spawn(async move {
-            let mut p = m1.start();
-            p.kv_set("default".into(), "ck".into(), b"v".to_vec(), 0);
-            p.end().await.unwrap();
+            let id = m1.lock().unwrap().start();
+            m1.lock().unwrap().get(id).unwrap().lock().unwrap().kv_set(
+                "default".into(),
+                "ck".into(),
+                b"v".to_vec(),
+                0,
+            );
+            let pipeline = m1.lock().unwrap().take(id).unwrap();
+            pipeline.end().await.unwrap();
         });
 
         let h2 = tokio::spawn(async move {
-            let mut p = m2.start();
-            p.list_push("cl".into(), b"item".to_vec());
-            p.end().await.unwrap();
+            let id = m2.lock().unwrap().start();
+            m2.lock()
+                .unwrap()
+                .get(id)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .list_push("cl".into(), b"item".to_vec());
+            let pipeline = m2.lock().unwrap().take(id).unwrap();
+            pipeline.end().await.unwrap();
         });
 
         h1.await.unwrap();
@@ -438,24 +477,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_pipeline_ordering_by_op_count() {
-        let (manager, _db) = make_manager().await;
-        let manager = Arc::new(manager);
+        let (mut manager, _db) = make_manager().await;
+        let manager = Arc::new(Mutex::new(manager));
 
         let mut handles = vec![];
         for i in 0..5u32 {
             let m = Arc::clone(&manager);
             let ops = (5 - i) as usize;
             handles.push(tokio::spawn(async move {
-                let mut p = m.start();
-                for j in 0..ops {
-                    p.kv_set(
-                        "default".into(),
-                        format!("ord_{}_{}", i, j),
-                        b"v".to_vec(),
-                        0,
-                    );
+                let id = m.lock().unwrap().start();
+                {
+                    let mut mgr = m.lock().unwrap();
+                    let arc = mgr.get(id).unwrap();
+                    let mut p = arc.lock().unwrap();
+                    for j in 0..ops {
+                        p.kv_set(
+                            "default".into(),
+                            format!("ord_{}_{}", i, j),
+                            b"v".to_vec(),
+                            0,
+                        );
+                    }
                 }
-                p.end().await.unwrap();
+                let pipeline = m.lock().unwrap().take(id).unwrap();
+                pipeline.end().await.unwrap();
             }));
         }
 
@@ -466,23 +511,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_pipeline() {
-        let (manager, _db) = make_manager().await;
-        let p = manager.start();
-        assert!(p.end().await.is_ok());
+        let (mut manager, _db) = make_manager().await;
+        let id = manager.start();
+        assert!(manager.take(id).unwrap().end().await.is_ok());
     }
 
     #[tokio::test]
     async fn test_kv_flush() {
-        let (manager, db) = make_manager().await;
+        let (mut manager, db) = make_manager().await;
         db.write()
             .await
             .kv_set("default".into(), "fk".into(), b"v".to_vec(), 0)
             .await
             .unwrap();
 
-        let mut p = manager.start();
-        p.kv_flush("default".into());
-        p.end().await.unwrap();
+        let id = manager.start();
+        manager
+            .get(id)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .kv_flush("default".into());
+        manager.take(id).unwrap().end().await.unwrap();
 
         let val = db
             .write()
@@ -491,5 +541,15 @@ mod tests {
             .await
             .unwrap();
         assert!(val.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_and_remove_pipeline() {
+        let (mut manager, _db) = make_manager().await;
+        let id = manager.start();
+
+        assert!(manager.get(id).is_some());
+        manager.remove(id);
+        assert!(manager.get(id).is_none());
     }
 }

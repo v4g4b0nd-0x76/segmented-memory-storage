@@ -4,10 +4,7 @@ use tokio::{net::TcpListener, sync::RwLock};
 use tokio_util::codec::Framed;
 
 use crate::{
-    db::{
-        db::DB,
-        pipeline::{Pipeline, PipelineManager},
-    },
+    db::{db::DB, pipeline::PipelineManager},
     server::{codec::*, proto::*},
 };
 
@@ -26,8 +23,8 @@ impl Server {
         }
     }
 
-    pub async fn pipeline(&self) -> Pipeline {
-        self.pipeline_manager.read().await.start()
+    pub async fn start_pipeline(&self) -> u64 {
+        self.pipeline_manager.write().await.start()
     }
 
     pub async fn start(&self, addr: &str) -> anyhow::Result<()> {
@@ -250,6 +247,8 @@ impl Server {
                     Err(e) => rb.err(&e.to_string()).to_vec(),
                 }
             }
+            Command::StartPipeline {} => rb.ok_u64(self.start_pipeline().await).to_vec(),
+            Command::EndPipeline { id } => rb.ok_empty().to_vec(),
         }
     }
 }

@@ -39,94 +39,42 @@ impl DB {
     pub async fn load_and_apply(&mut self) -> anyhow::Result<()> {
         let entries = load_aof(&self.aof_path).await?;
         println!("[AOF] replaying {} entries...", entries.len());
-        for entry in entries {
-            self.apply(entry).await;
-        }
+
+        let kv_store = Arc::clone(&self.kv_store);
+        let group_manager = Arc::clone(&self.group_manager);
+        let list = Arc::clone(&self.list);
+
+        let kv1 = Arc::clone(&kv_store);
+        let gm1 = Arc::clone(&group_manager);
+        let l1 = Arc::clone(&list);
+        let h1 = tokio::spawn(async move {
+            for entry in entries.kv_entries {
+                apply_aof(&kv1, &l1, &gm1, entry).await;
+            }
+        });
+
+        let kv2 = Arc::clone(&kv_store);
+        let gm2 = Arc::clone(&group_manager);
+        let l2 = Arc::clone(&list);
+        let h2 = tokio::spawn(async move {
+            for entry in entries.list_entries {
+                apply_aof(&kv2, &l2, &gm2, entry).await;
+            }
+        });
+
+        let h3 = tokio::spawn(async move {
+            for entry in entries.log_entries {
+                apply_aof(&kv_store, &list, &group_manager, entry).await;
+            }
+        });
+
+        let (r1, r2, r3) = tokio::join!(h1, h2, h3);
+        r1?;
+        r2?;
+        r3?;
+
         println!("[AOF] replay done");
         Ok(())
-    }
-
-    pub async fn log_and_apply_path(&mut self, aof_path: &Path) -> anyhow::Result<()> {
-        let entries = load_aof(aof_path).await?;
-        println!(
-            "[{}] replaying {} entries...",
-            aof_path.to_string_lossy(),
-            entries.len()
-        );
-        for entry in entries {
-            self.apply(entry).await;
-        }
-        println!("[{}] replay done", aof_path.to_string_lossy(),);
-        Ok(())
-    }
-
-    async fn apply(&mut self, entry: AofEntry) {
-        match entry {
-            AofEntry::KvSet { db, key, val, ttl } => {
-                let _ = self.kv_store.write().await.set(db, key, val, ttl);
-            }
-            AofEntry::KvDel { db, key } => {
-                let _ = self.kv_store.write().await.del(db, key);
-            }
-            AofEntry::KvFlush { db } => {
-                let _ = self.kv_store.write().await.flush(db);
-            }
-            AofEntry::LogCreateGroup { name } => {
-                let _ = self.group_manager.write().await.create_group(&name).await;
-            }
-            AofEntry::LogDropGroup { name } => {
-                let _ = self.group_manager.write().await.drop_group(&name).await;
-            }
-            AofEntry::LogAdd {
-                group,
-                timestamp,
-                payload,
-            } => {
-                let _ = self
-                    .group_manager
-                    .write()
-                    .await
-                    .add(&group, timestamp, &payload)
-                    .await;
-            }
-            AofEntry::LogAddRange { group, entries } => {
-                let owned: Vec<(u64, Vec<u8>)> = entries;
-                let refs: Vec<(u64, &[u8])> =
-                    owned.iter().map(|(ts, d)| (*ts, d.as_slice())).collect();
-                let _ = self
-                    .group_manager
-                    .write()
-                    .await
-                    .add_range(&group, &refs)
-                    .await;
-            }
-            AofEntry::LogRemove { group, up_to_id } => {
-                let _ = self
-                    .group_manager
-                    .write()
-                    .await
-                    .remove(&group, up_to_id)
-                    .await;
-            }
-            AofEntry::ListPush { key, payload } => {
-                let _ = self.list.write().await.push(key, payload).await;
-            }
-            AofEntry::ListPushRange { key, items } => {
-                let _ = self.list.write().await.push_range(key, items).await;
-            }
-            AofEntry::ListPop { key } => {
-                let _ = self.list.write().await.pop(key).await;
-            }
-            AofEntry::ListPopRange { key, start, end } => {
-                let _ = self.list.write().await.pop_range(key, start, end).await;
-            }
-            AofEntry::ListPopCount { key, count } => {
-                let _ = self.list.write().await.pop_count(key, count).await;
-            }
-            AofEntry::ListFlush { key } => {
-                let _ = self.list.write().await.flush(key).await;
-            }
-        }
     }
 
     pub async fn kv_set(
@@ -389,6 +337,67 @@ impl DB {
     }
 }
 
+async fn apply_aof(
+    kv_store: &Arc<RwLock<KvStore>>,
+    list: &Arc<RwLock<SegList>>,
+    group_manager: &Arc<RwLock<GroupManager>>,
+    entry: AofEntry,
+) {
+    match entry {
+        AofEntry::KvSet { db, key, val, ttl } => {
+            let _ = kv_store.write().await.set(db, key, val, ttl);
+        }
+        AofEntry::KvDel { db, key } => {
+            let _ = kv_store.write().await.del(db, key);
+        }
+        AofEntry::KvFlush { db } => {
+            let _ = kv_store.write().await.flush(db);
+        }
+        AofEntry::LogCreateGroup { name } => {
+            let _ = group_manager.write().await.create_group(&name).await;
+        }
+        AofEntry::LogDropGroup { name } => {
+            let _ = group_manager.write().await.drop_group(&name).await;
+        }
+        AofEntry::LogAdd {
+            group,
+            timestamp,
+            payload,
+        } => {
+            let _ = group_manager
+                .write()
+                .await
+                .add(&group, timestamp, &payload)
+                .await;
+        }
+        AofEntry::LogAddRange { group, entries } => {
+            let owned: Vec<(u64, Vec<u8>)> = entries;
+            let refs: Vec<(u64, &[u8])> = owned.iter().map(|(ts, d)| (*ts, d.as_slice())).collect();
+            let _ = group_manager.write().await.add_range(&group, &refs).await;
+        }
+        AofEntry::LogRemove { group, up_to_id } => {
+            let _ = group_manager.write().await.remove(&group, up_to_id).await;
+        }
+        AofEntry::ListPush { key, payload } => {
+            let _ = list.write().await.push(key, payload).await;
+        }
+        AofEntry::ListPushRange { key, items } => {
+            let _ = list.write().await.push_range(key, items).await;
+        }
+        AofEntry::ListPop { key } => {
+            let _ = list.write().await.pop(key).await;
+        }
+        AofEntry::ListPopRange { key, start, end } => {
+            let _ = list.write().await.pop_range(key, start, end).await;
+        }
+        AofEntry::ListPopCount { key, count } => {
+            let _ = list.write().await.pop_count(key, count).await;
+        }
+        AofEntry::ListFlush { key } => {
+            let _ = list.write().await.flush(key).await;
+        }
+    }
+}
 #[derive(Debug)]
 pub enum DBError {
     LogCreateGroupError(GroupError),

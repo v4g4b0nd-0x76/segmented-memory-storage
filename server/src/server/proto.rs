@@ -103,6 +103,10 @@ pub enum Command<'a> {
     LFlush {
         key: &'a str,
     },
+    StartPipeline {},
+    EndPipeline {
+        id: u64,
+    },
 }
 
 #[derive(Debug)]
