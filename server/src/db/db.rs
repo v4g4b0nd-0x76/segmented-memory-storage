@@ -87,7 +87,7 @@ impl DB {
         self.kv_store
             .write()
             .await
-            .set(db.clone(), key.clone(), val.clone(), ttl)
+            .set(&db, key.clone(), val.clone(), ttl)
             .map_err(DBError::KVSetError)?;
         self.aof.write(AofEntry::KvSet { db, key, val, ttl });
         Ok(())
@@ -97,7 +97,7 @@ impl DB {
         self.kv_store
             .write()
             .await
-            .get(db, key)
+            .get(&db, key)
             .map_err(DBError::KVGetError)
     }
 
@@ -105,7 +105,7 @@ impl DB {
         self.kv_store
             .write()
             .await
-            .del(db.clone(), key.clone())
+            .del(&db, &key)
             .map_err(DBError::KVDelError)?;
         self.aof.write(AofEntry::KvDel { db, key });
         Ok(())
@@ -115,7 +115,7 @@ impl DB {
         self.kv_store
             .write()
             .await
-            .keys(db)
+            .keys(&db)
             .map_err(DBError::KVKeysError)
     }
 
@@ -123,7 +123,7 @@ impl DB {
         self.kv_store
             .write()
             .await
-            .flush(db.clone())
+            .flush(&db)
             .map_err(DBError::KVFlushError)?;
         self.aof.write(AofEntry::KvFlush { db });
         Ok(())
@@ -345,13 +345,13 @@ async fn apply_aof(
 ) {
     match entry {
         AofEntry::KvSet { db, key, val, ttl } => {
-            let _ = kv_store.write().await.set(db, key, val, ttl);
+            let _ = kv_store.write().await.set(&db, key, val, ttl);
         }
         AofEntry::KvDel { db, key } => {
-            let _ = kv_store.write().await.del(db, key);
+            let _ = kv_store.write().await.del(&db, &key);
         }
         AofEntry::KvFlush { db } => {
-            let _ = kv_store.write().await.flush(db);
+            let _ = kv_store.write().await.flush(&db);
         }
         AofEntry::LogCreateGroup { name } => {
             let _ = group_manager.write().await.create_group(&name).await;

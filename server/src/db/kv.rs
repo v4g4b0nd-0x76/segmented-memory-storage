@@ -18,34 +18,32 @@ struct DB {
 }
 
 impl DB {
-    fn new(id: String) -> Self {
+    fn new(id: &str) -> Self {
         DB {
-            id,
-            entries: HashMap::new(),
+            id: id.to_string(),
+            entries: HashMap::with_capacity(1024),
         }
     }
 
-    fn set(&mut self, key: String, entry: DBEntry) -> anyhow::Result<()> {
+    fn set(&mut self, key: String, entry: DBEntry) {
         self.entries.insert(key, entry);
-        Ok(())
     }
 
-    fn get(&mut self, key: String) -> anyhow::Result<Option<DBEntry>> {
-        match self.entries.get(&key) {
-            None => Ok(None),
-            Some(val) => {
-                if val.ttl != 0 && val.ttl < chrono::Utc::now().timestamp_millis() {
-                    self.entries.remove(&key);
-                    return Ok(None);
-                }
-                Ok(self.entries.get(&key).cloned())
-            }
+    fn get(&mut self, key: &str) -> Option<DBEntry> {
+        let expired = match self.entries.get(key) {
+            None => return None,
+            Some(val) => val.ttl != 0 && val.ttl < chrono::Utc::now().timestamp_millis(),
+        };
+        if expired {
+            self.entries.remove(key);
+            return None;
         }
+        self.entries.get(key).cloned()
     }
 
-    fn del(&mut self, key: String) -> anyhow::Result<()> {
+    fn del(&mut self, key: &str) -> anyhow::Result<()> {
         self.entries
-            .remove(&key)
+            .remove(key)
             .ok_or_else(|| anyhow!("{} not found", key))?;
         Ok(())
     }
@@ -67,7 +65,11 @@ pub struct KvStore {
 
 impl KvStore {
     fn cache_key(db: &str, key: &str) -> String {
-        format!("{}:{}", db, key)
+        let mut s = String::with_capacity(db.len() + 1 + key.len());
+        s.push_str(db);
+        s.push(':');
+        s.push_str(key);
+        s
     }
 
     pub fn new(lru_size: Option<usize>) -> Self {
@@ -79,13 +81,10 @@ impl KvStore {
         }
     }
 
-    fn get_db_mut(&mut self, db: &str) -> anyhow::Result<&mut DB> {
-        if !self.dbs.contains_key(db) {
-            self.dbs.insert(db.to_string(), DB::new(db.to_string()));
-        }
+    fn get_db_mut(&mut self, db: &str) -> &mut DB {
         self.dbs
-            .get_mut(db)
-            .ok_or_else(|| anyhow!("invalid database: {}", db))
+            .entry(db.to_string())
+            .or_insert_with(|| DB::new(db))
     }
 
     fn get_db(&self, db: &str) -> anyhow::Result<&DB> {
@@ -94,55 +93,52 @@ impl KvStore {
             .ok_or_else(|| anyhow!("invalid database: {}", db))
     }
 
-    pub fn set(&mut self, db: String, key: String, val: Vec<u8>, ttl: i64) -> anyhow::Result<()> {
+    pub fn set(&mut self, db: &str, key: String, val: Vec<u8>, ttl: i64) -> anyhow::Result<()> {
         let ttl_ts = if ttl == 0 {
             0
         } else {
             chrono::Utc::now().timestamp_millis() + ttl
         };
-        self.lru.remove(&Self::cache_key(&db, &key));
-        let db = self.get_db_mut(&db)?;
-        db.set(key, DBEntry { val, ttl: ttl_ts })
+        self.lru.remove(&Self::cache_key(db, &key));
+        self.get_db_mut(db).set(key, DBEntry { val, ttl: ttl_ts });
+        Ok(())
     }
 
-    pub fn get(&mut self, db: String, key: String) -> anyhow::Result<Option<DBEntry>> {
-        let ck = Self::cache_key(&db, &key);
+    pub fn get(&mut self, db: &str, key: String) -> anyhow::Result<Option<DBEntry>> {
+        let ck = Self::cache_key(db, &key);
         if let Some(entry) = self.lru.get(&ck) {
             return Ok(Some(entry.clone()));
         }
-        let db_ref = self.get_db_mut(&db)?;
-        let result = db_ref.get(key)?;
+        let result = self.get_db_mut(db).get(&key);
         if let Some(ref entry) = result {
             self.lru.insert(ck, entry.clone());
         }
         Ok(result)
     }
 
-    pub fn del(&mut self, db: String, key: String) -> anyhow::Result<()> {
-        self.lru.remove(&Self::cache_key(&db, &key));
-        let db = self.get_db_mut(&db)?;
-        db.del(key)
+    pub fn del(&mut self, db: &str, key: &str) -> anyhow::Result<()> {
+        self.lru.remove(&Self::cache_key(db, key));
+        self.get_db_mut(db).del(key)
     }
 
-    pub fn keys(&self, db: String) -> anyhow::Result<Vec<String>> {
-        if !self.dbs.contains_key(&db) {
-            return Ok(vec![]);
+    pub fn keys(&self, db: &str) -> anyhow::Result<Vec<String>> {
+        match self.dbs.get(db) {
+            None => Ok(vec![]),
+            Some(db) => Ok(db.keys()),
         }
-        Ok(self.get_db(&db)?.keys())
     }
 
-    pub fn flush(&mut self, db: String) -> anyhow::Result<()> {
-        let db = self.get_db_mut(&db)?;
-        db.flush();
+    pub fn flush(&mut self, db: &str) -> anyhow::Result<()> {
+        self.get_db_mut(db).flush();
         self.lru = LRU::new(self.lru_size, Duration::from_secs(60));
         Ok(())
     }
 
-    pub fn create_db(&mut self, id: String) -> anyhow::Result<()> {
-        if self.dbs.contains_key(&id) {
+    pub fn create_db(&mut self, id: &str) -> anyhow::Result<()> {
+        if self.dbs.contains_key(id) {
             return Err(anyhow!("database {} already exists", id));
         }
-        self.dbs.insert(id.clone(), DB::new(id));
+        self.dbs.insert(id.to_string(), DB::new(id));
         Ok(())
     }
 }
@@ -156,42 +152,41 @@ mod tests {
         let mut store = KvStore::new(None);
 
         store
-            .set("db".into(), "k1".into(), b"hello".to_vec(), 0)
+            .set("db", "k1".to_string(), b"hello".to_vec(), 0)
             .unwrap();
         store
-            .set("db".into(), "k2".into(), b"world".to_vec(), 0)
+            .set("db", "k2".to_string(), b"world".to_vec(), 0)
             .unwrap();
 
-        let v1 = store.get("db".into(), "k1".into()).unwrap().unwrap();
+        let v1 = store.get("db", "k1".to_string()).unwrap().unwrap();
         assert_eq!(v1.val, b"hello");
 
-        let keys = store.keys("db".into()).unwrap();
+        let keys = store.keys("db").unwrap();
         assert_eq!(keys.len(), 2);
 
-        store.del("db".into(), "k1".into()).unwrap();
-        assert!(store.get("db".into(), "k1".into()).unwrap().is_none());
+        store.del("db", "k1").unwrap();
+        assert!(store.get("db", "k1".to_string()).unwrap().is_none());
 
-        store.flush("db".into()).unwrap();
-        assert!(store.keys("db".into()).unwrap().is_empty());
+        store.flush("db").unwrap();
+        assert!(store.keys("db").unwrap().is_empty());
     }
 
     #[test]
     fn test_ttl_expiry() {
         let mut store = KvStore::new(None);
-        store
-            .set("db".into(), "k1".into(), b"v".to_vec(), 1)
-            .unwrap();
+        store.set("db", "k1".to_string(), b"v".to_vec(), 1).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
-        assert!(store.get("db".into(), "k1".into()).unwrap().is_none());
+        assert!(store.get("db", "k1".to_string()).unwrap().is_none());
     }
 
     #[test]
     fn test_create_db_duplicate() {
         let mut store = KvStore::new(None);
-        store.create_db("mydb".into()).unwrap();
-        assert!(store.create_db("mydb".into()).is_err());
+        store.create_db("mydb").unwrap();
+        assert!(store.create_db("mydb").is_err());
     }
 }
+
 #[cfg(test)]
 mod bench {
     use super::*;
@@ -201,11 +196,10 @@ mod bench {
     fn bench_kv_realistic() {
         let total: usize = 5_000_000;
         let unique_keys: usize = 2_000_000;
-        let db = "bench_db".to_string();
+        let db = "bench_db";
 
         let mut store = KvStore::new(Some(unique_keys));
 
-        // --- Phase 1: Write ---
         println!(
             "\n[BENCH] Writing {} entries ({} unique keys)...",
             total, unique_keys
@@ -215,7 +209,7 @@ mod bench {
         for i in 0..total {
             let key = format!("key:{}", i % unique_keys);
             let val = format!("value:{}", i).into_bytes();
-            store.set(db.clone(), key, val, 0).unwrap();
+            store.set(db, key, val, 0).unwrap();
         }
 
         let elapsed = start.elapsed();
@@ -225,13 +219,12 @@ mod bench {
             total as f64 / elapsed.as_secs_f64()
         );
 
-        // --- Phase 2: Delete 10% ---
         let delete_count = unique_keys / 10;
         println!("[BENCH] Deleting {} keys...", delete_count);
         let start = Instant::now();
 
         for i in 0..delete_count {
-            let _ = store.del(db.clone(), format!("key:{}", i));
+            let _ = store.del(db, &format!("key:{}", i));
         }
 
         let elapsed = start.elapsed();
@@ -241,7 +234,6 @@ mod bench {
             delete_count as f64 / elapsed.as_secs_f64()
         );
 
-        // --- Phase 3: Mixed reads ---
         let read_count = 500_000;
         println!(
             "[BENCH] Reading {} keys (mixed hits/misses/deleted)...",
@@ -253,7 +245,7 @@ mod bench {
 
         for i in 0..read_count {
             let key = format!("key:{}", i % unique_keys);
-            match store.get(db.clone(), key).unwrap() {
+            match store.get(db, key).unwrap() {
                 Some(_) => hits += 1,
                 None => misses += 1,
             }
@@ -268,10 +260,9 @@ mod bench {
             misses
         );
 
-        // --- Phase 4: Flush ---
         println!("[BENCH] Flushing db...");
         let start = Instant::now();
-        store.flush(db.clone()).unwrap();
+        store.flush(db).unwrap();
         println!("[BENCH] Flush done: {:?}", start.elapsed());
 
         assert!(store.keys(db).unwrap().is_empty());

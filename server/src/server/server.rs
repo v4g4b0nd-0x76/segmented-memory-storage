@@ -247,6 +247,9 @@ impl Server {
                     Err(e) => rb.err(&e.to_string()).to_vec(),
                 }
             }
+            // TODO: implement pipeline api
+            // user starts a pipeline and in modification request can send pipeline as option if pipeline id is provided we add the given command to pipeline and when the pipeline is ended we execute it
+            // TODO: each pipeline shall have a deadline of for example 10 second from previous command and if not given the pipeline would be removed
             Command::StartPipeline {} => rb.ok_u64(self.start_pipeline().await).to_vec(),
             Command::EndPipeline { id } => rb.ok_empty().to_vec(),
         }
