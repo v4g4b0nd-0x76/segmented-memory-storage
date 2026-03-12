@@ -1,15 +1,14 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-use tokio::sync::{Mutex, RwLock};
+use std::{path::PathBuf, sync::Arc};
+use tokio::sync::RwLock;
 
-use crate::db::{
-    aof::{AofEntry, AofWriter, load_aof},
-    groups::{GroupError, GroupManager, GroupStats},
-    kv::{DBEntry, KvStore},
-    pipeline::PipelineManager,
-    seg_list::{ListError, SegList},
+use crate::{
+    conf::Conf,
+    db::{
+        aof::{AofEntry, AofWriter, load_aof},
+        groups::{GroupError, GroupManager, GroupStats},
+        kv::{DBEntry, KvStore},
+        seg_list::{ListError, SegList},
+    },
 };
 
 pub struct DB {
@@ -21,12 +20,12 @@ pub struct DB {
 }
 
 impl DB {
-    pub async fn new() -> Self {
-        let aof_path = PathBuf::from("aof/log.aof");
+    pub async fn new(conf: Arc<Conf>) -> Self {
+        let aof_path = PathBuf::from(conf.aof.dir.clone());
         let aof = AofWriter::new(aof_path.clone());
         let mut db = DB {
             group_manager: Arc::new(RwLock::new(GroupManager::new())),
-            kv_store: Arc::new(RwLock::new(KvStore::new(None))),
+            kv_store: Arc::new(RwLock::new(KvStore::new(Some(conf.lru_size)))),
             list: Arc::new(RwLock::new(SegList::new().await)),
             aof,
             aof_path,

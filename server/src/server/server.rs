@@ -4,20 +4,23 @@ use tokio::{net::TcpListener, sync::RwLock};
 use tokio_util::codec::Framed;
 
 use crate::{
+    conf::Conf,
     db::{db::DB, pipeline::PipelineManager},
     server::{codec::*, proto::*},
 };
 
 pub struct Server {
+    conf: Arc<Conf>,
     db: Arc<RwLock<DB>>,
     pipeline_manager: Arc<RwLock<PipelineManager>>,
 }
 
 impl Server {
-    pub async fn new() -> Self {
-        let db = Arc::new(RwLock::new(DB::new().await));
+    pub async fn new(conf: Arc<Conf>) -> Self {
+        let db = Arc::new(RwLock::new(DB::new(Arc::clone(&conf)).await));
         let pipeline_manager = Arc::new(RwLock::new(PipelineManager::new(Arc::clone(&db))));
         Server {
+            conf,
             db,
             pipeline_manager,
         }
@@ -34,6 +37,7 @@ impl Server {
             println!("New connection from {}", peer);
             socket.set_nodelay(true)?;
             let server = Arc::new(Server {
+                conf: Arc::clone(&self.conf),
                 db: Arc::clone(&self.db),
                 pipeline_manager: Arc::clone(&self.pipeline_manager),
             });

@@ -400,10 +400,13 @@ async fn execute_job(
 
 #[cfg(test)]
 mod tests {
+    use crate::conf::Conf;
+
     use super::*;
 
     async fn make_manager() -> (PipelineManager, Arc<RwLock<DB>>) {
-        let db = Arc::new(RwLock::new(DB::new().await));
+        let conf = Arc::new(Conf::load().await.unwrap());
+        let db = Arc::new(RwLock::new(DB::new(Arc::clone(&conf)).await));
         let manager = PipelineManager::new(Arc::clone(&db));
         (manager, db)
     }
