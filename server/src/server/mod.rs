@@ -1,3 +1,3 @@
 mod codec;
-mod proto;
+pub mod proto;
 pub mod server;

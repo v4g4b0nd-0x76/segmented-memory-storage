@@ -20,6 +20,12 @@ pub const LPOP_COUNT: u8 = 0x19;
 pub const LLEN: u8 = 0x20;
 pub const LFLUSH: u8 = 0x21;
 
+// ha commands
+
+pub const HA_REGISTER: u8 = 0x22;
+pub const HA_HEARTBEAT: u8 = 0x23;
+pub const HA_SYNC: u8 = 0x24;
+
 pub const STATUS_OK: u8 = 0x00;
 pub const STATUS_ERR: u8 = 0x01;
 
@@ -107,6 +113,16 @@ pub enum Command<'a> {
     EndPipeline {
         id: u64,
     },
+    //     HA_REGISTER
+    // HA_HEARTBEAT
+    // HA_SYNC
+    HaRegisterFollower {
+        addr: &'a str, // follower send register message with its address and master will add it to followers list
+    },
+    HaHeartBeat {}, // master send heartbeat message and expect an ACK
+    HaSync {
+        entries: Vec<&'a [u8]>,
+    }, // follower send a sync message and receive AOF file
 }
 
 #[derive(Debug)]
@@ -319,6 +335,20 @@ pub fn parse_command(frame: &[u8]) -> Result<Command<'_>, ParseError> {
             let key = cur.read_str()?;
             Ok(Command::LFlush { key })
         }
+        HA_REGISTER => {
+            let addr = cur.read_str()?;
+            Ok(Command::HaRegisterFollower { addr: addr })
+        }
+        HA_HEARTBEAT => Ok(Command::HaHeartBeat {}),
+        HA_SYNC => {
+            let count = cur.read_u32_le()? as usize;
+            let mut vals: Vec<&[u8]> = Vec::with_capacity(count);
+            for _ in 0..count {
+                vals.push(cur.read_bytes()?);
+            }
+            Ok(Command::HaSync { entries: vals })
+        }
+
         _ => Err(ParseError("unknown command tag")),
     }
 }

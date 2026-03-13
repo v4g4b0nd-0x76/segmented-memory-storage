@@ -5,7 +5,12 @@ use tokio_util::codec::Framed;
 
 use crate::{
     conf::Conf,
-    db::{db::DB, pipeline::PipelineManager},
+    db::{
+        aof::{self, AofEntry},
+        db::DB,
+        pipeline::PipelineManager,
+    },
+    ha::HaManager,
     server::{codec::*, proto::*},
 };
 
@@ -13,16 +18,21 @@ pub struct Server {
     conf: Arc<Conf>,
     db: Arc<RwLock<DB>>,
     pipeline_manager: Arc<RwLock<PipelineManager>>,
+    ha_manager: Arc<RwLock<HaManager>>,
 }
 
 impl Server {
-    pub async fn new(conf: Arc<Conf>) -> Self {
-        let db = Arc::new(RwLock::new(DB::new(Arc::clone(&conf)).await));
+    pub async fn new(
+        conf: Arc<Conf>,
+        db: Arc<RwLock<DB>>,
+        ha_manager: Arc<RwLock<HaManager>>,
+    ) -> Self {
         let pipeline_manager = Arc::new(RwLock::new(PipelineManager::new(Arc::clone(&db))));
         Server {
             conf,
             db,
             pipeline_manager,
+            ha_manager,
         }
     }
 
@@ -40,6 +50,7 @@ impl Server {
                 conf: Arc::clone(&self.conf),
                 db: Arc::clone(&self.db),
                 pipeline_manager: Arc::clone(&self.pipeline_manager),
+                ha_manager: Arc::clone(&self.ha_manager),
             });
             tokio::spawn(async move {
                 let mut framed = Framed::new(socket, LengthPrefixCodec);
@@ -251,11 +262,32 @@ impl Server {
                     Err(e) => rb.err(&e.to_string()).to_vec(),
                 }
             }
-            // TODO: implement pipeline api
-            // user starts a pipeline and in modification request can send pipeline as option if pipeline id is provided we add the given command to pipeline and when the pipeline is ended we execute it
-            // TODO: each pipeline shall have a deadline of for example 10 second from previous command and if not given the pipeline would be removed
+            // TODO: implement pipeline endpoints
             Command::StartPipeline {} => rb.ok_u64(self.start_pipeline().await).to_vec(),
             Command::EndPipeline { id } => rb.ok_empty().to_vec(),
+            // ha endpoints
+            Command::HaRegisterFollower { addr } => {
+                match self.ha_manager.write().await.register_follower(addr).await {
+                    Ok(_) => rb.ok_empty().to_vec(),
+                    Err(e) => rb.err(&e.to_string()).to_vec(),
+                }
+            }
+            Command::HaHeartBeat {} => match self.ha_manager.write().await.ack_heartbeat().await {
+                Ok(_) => rb.ok_bytes("ACK".as_bytes()).to_vec(),
+                Err(e) => rb.err(&e.to_string()).to_vec(),
+            },
+            Command::HaSync { entries } => {
+                let mut decoded_entries: Vec<AofEntry> = Vec::with_capacity(entries.len());
+                for raw in entries {
+                    let s = std::str::from_utf8(raw).unwrap();
+                    let entry = aof::from_base64(s).unwrap();
+                    decoded_entries.push(entry);
+                }
+                match self.db.write().await.apply_aof(decoded_entries).await {
+                    Ok(_) => rb.ok_empty().to_vec(),
+                    Err(e) => rb.err(&e.to_string()).to_vec(),
+                }
+            }
         }
     }
 }

@@ -86,6 +86,69 @@ impl AofEntry {
             | AofEntry::ListFlush { .. } => EntryCategory::List,
         }
     }
+    pub fn to_base64(&self) -> String {
+        let json = serde_json::to_vec(self).unwrap();
+        use std::fmt::Write;
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        let mut i = 0;
+        while i + 2 < json.len() {
+            let b = ((json[i] as u32) << 16) | ((json[i + 1] as u32) << 8) | (json[i + 2] as u32);
+            out.push(CHARS[((b >> 18) & 63) as usize] as char);
+            out.push(CHARS[((b >> 12) & 63) as usize] as char);
+            out.push(CHARS[((b >> 6) & 63) as usize] as char);
+            out.push(CHARS[(b & 63) as usize] as char);
+            i += 3;
+        }
+        match json.len() - i {
+            1 => {
+                let b = (json[i] as u32) << 16;
+                out.push(CHARS[((b >> 18) & 63) as usize] as char);
+                out.push(CHARS[((b >> 12) & 63) as usize] as char);
+                out.push_str("==");
+            }
+            2 => {
+                let b = ((json[i] as u32) << 16) | ((json[i + 1] as u32) << 8);
+                out.push(CHARS[((b >> 18) & 63) as usize] as char);
+                out.push(CHARS[((b >> 12) & 63) as usize] as char);
+                out.push(CHARS[((b >> 6) & 63) as usize] as char);
+                out.push('=');
+            }
+            _ => {}
+        }
+        out
+    }
+}
+
+pub fn from_base64(s: &str) -> anyhow::Result<AofEntry> {
+    let s = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let decode_char = |c: u8| -> u8 {
+        match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => 0,
+        }
+    };
+    let mut i = 0;
+    while i + 3 < s.len() {
+        let b = ((decode_char(s[i]) as u32) << 18)
+            | ((decode_char(s[i + 1]) as u32) << 12)
+            | ((decode_char(s[i + 2]) as u32) << 6)
+            | (decode_char(s[i + 3]) as u32);
+        out.push((b >> 16) as u8);
+        if s[i + 2] != b'=' {
+            out.push((b >> 8) as u8);
+        }
+        if s[i + 3] != b'=' {
+            out.push(b as u8);
+        }
+        i += 4;
+    }
+    Ok(serde_json::from_slice(&out)?)
 }
 
 enum EntryCategory {
@@ -147,7 +210,7 @@ impl AofEntries {
     }
 }
 
-pub async fn load_aof(path: &Path) -> anyhow::Result<AofEntries> {
+pub async fn load_aof_separated(path: &Path) -> anyhow::Result<AofEntries> {
     if !path.exists() {
         return Ok(AofEntries::default());
     }
@@ -173,6 +236,28 @@ pub async fn load_aof(path: &Path) -> anyhow::Result<AofEntries> {
     Ok(entries)
 }
 
+pub async fn load_aof(path: &Path) -> anyhow::Result<Vec<AofEntry>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries: Vec<AofEntry> = Vec::new();
+    let mut lines = BufReader::new(File::open(path).await?).lines();
+
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<AofEntry>(&line) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => eprintln!("[AOF] skipping corrupt line: {}", e),
+        }
+    }
+
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,12 +273,12 @@ mod tests {
         }
         drop(writer);
         sleep(Duration::from_millis(100)).await;
-        load_aof(&path).await.unwrap()
+        load_aof_separated(&path).await.unwrap()
     }
 
     #[tokio::test]
     async fn test_load_nonexistent_file() {
-        let result = load_aof(Path::new("nonexistent/path/log.aof"))
+        let result = load_aof_separated(Path::new("nonexistent/path/log.aof"))
             .await
             .unwrap();
         assert!(result.is_empty());
@@ -346,7 +431,7 @@ mod tests {
         .await
         .unwrap();
 
-        let entries = load_aof(&path).await.unwrap();
+        let entries = load_aof_separated(&path).await.unwrap();
         assert_eq!(entries.kv_entries.len(), 2);
     }
 
@@ -357,7 +442,7 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = load_aof(&path).await.unwrap();
+        let entries = load_aof_separated(&path).await.unwrap();
         assert_eq!(entries.kv_entries.len(), 1);
     }
 
@@ -378,7 +463,7 @@ mod tests {
             sleep(Duration::from_millis(50)).await;
         }
 
-        let entries = load_aof(&path).await.unwrap();
+        let entries = load_aof_separated(&path).await.unwrap();
         assert_eq!(entries.kv_entries.len(), 3);
     }
 }

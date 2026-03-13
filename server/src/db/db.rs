@@ -4,7 +4,7 @@ use tokio::sync::RwLock;
 use crate::{
     conf::Conf,
     db::{
-        aof::{AofEntry, AofWriter, load_aof},
+        aof::{AofEntry, AofWriter, load_aof, load_aof_separated},
         groups::{GroupError, GroupManager, GroupStats},
         kv::{DBEntry, KvStore},
         seg_list::{ListError, SegList},
@@ -34,9 +34,16 @@ impl DB {
         db.load_and_apply().await.expect("failed to load aof");
         db
     }
+    pub async fn get_aof_copy(&self) -> anyhow::Result<Vec<AofEntry>> {
+        let entries = load_aof(&self.aof_path).await?;
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(entries)
+    }
 
     pub async fn load_and_apply(&mut self) -> anyhow::Result<()> {
-        let entries = load_aof(&self.aof_path).await?;
+        let entries = load_aof_separated(&self.aof_path).await?;
         println!("[AOF] replaying {} entries...", entries.len());
 
         let kv_store = Arc::clone(&self.kv_store);
@@ -73,6 +80,66 @@ impl DB {
         r3?;
 
         println!("[AOF] replay done");
+        Ok(())
+    }
+
+    pub async fn apply_aof(&mut self, entries: Vec<AofEntry>) -> anyhow::Result<(), DBError> {
+        for entry in entries {
+            match entry {
+                AofEntry::KvSet { db, key, val, ttl } => {
+                    self.kv_store.write().await.set(&db, key, val, ttl);
+                }
+                AofEntry::KvDel { db, key } => {
+                    self.kv_store.write().await.del(&db, &key);
+                }
+                AofEntry::KvFlush { db } => {
+                    self.kv_store.write().await.flush(&db);
+                }
+                AofEntry::LogCreateGroup { name } => {
+                    self.group_manager.write().await.create_group(&name);
+                }
+                AofEntry::LogDropGroup { name } => {
+                    self.group_manager.write().await.drop_group(&name);
+                }
+                AofEntry::LogAdd {
+                    group,
+                    timestamp,
+                    payload,
+                } => {
+                    self.group_manager
+                        .write()
+                        .await
+                        .add(&group, timestamp, payload.as_slice());
+                }
+                AofEntry::LogAddRange { group, entries } => {
+                    let owned: Vec<(u64, Vec<u8>)> = entries;
+                    let refs: Vec<(u64, &[u8])> =
+                        owned.iter().map(|(ts, d)| (*ts, d.as_slice())).collect();
+                    self.group_manager.write().await.add_range(&group, &refs);
+                }
+                AofEntry::LogRemove { group, up_to_id } => {
+                    self.group_manager.write().await.remove(&group, up_to_id);
+                }
+                AofEntry::ListPush { key, payload } => {
+                    self.list.write().await.push(key, payload);
+                }
+                AofEntry::ListPushRange { key, items } => {
+                    self.list.write().await.push_range(key, items);
+                }
+                AofEntry::ListPop { key } => {
+                    self.list.write().await.pop(key);
+                }
+                AofEntry::ListPopRange { key, start, end } => {
+                    self.list.write().await.pop_range(key, start, end);
+                }
+                AofEntry::ListPopCount { key, count } => {
+                    self.list.write().await.pop_count(key, count);
+                }
+                AofEntry::ListFlush { key } => {
+                    self.list.write().await.flush(key);
+                }
+            }
+        }
         Ok(())
     }
 
