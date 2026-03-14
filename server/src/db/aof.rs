@@ -88,7 +88,6 @@ impl AofEntry {
     }
     pub fn to_base64(&self) -> String {
         let json = serde_json::to_vec(self).unwrap();
-        use std::fmt::Write;
         const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         let mut i = 0;
@@ -119,7 +118,7 @@ impl AofEntry {
         out
     }
 }
-
+// TODO: replace with base64 builder
 pub fn from_base64(s: &str) -> anyhow::Result<AofEntry> {
     let s = s.as_bytes();
     let mut out = Vec::with_capacity(s.len() * 3 / 4);

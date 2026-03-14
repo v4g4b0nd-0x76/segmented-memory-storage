@@ -406,7 +406,7 @@ mod tests {
 
     async fn make_manager() -> (PipelineManager, Arc<RwLock<DB>>) {
         let conf = Arc::new(Conf::load().await.unwrap());
-        let db = Arc::new(RwLock::new(DB::new(Arc::clone(&conf)).await));
+        let db = Arc::new(RwLock::new(DB::new(Arc::clone(&conf), None).await));
         let manager = PipelineManager::new(Arc::clone(&db));
         (manager, db)
     }

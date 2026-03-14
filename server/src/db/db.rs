@@ -1,5 +1,5 @@
 use std::{path::PathBuf, sync::Arc};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 use crate::{
     conf::Conf,
@@ -17,18 +17,21 @@ pub struct DB {
     list: Arc<RwLock<SegList>>,
     aof: AofWriter,
     aof_path: PathBuf,
+    event_tx: Option<mpsc::UnboundedSender<AofEntry>>,
 }
 
 impl DB {
-    pub async fn new(conf: Arc<Conf>) -> Self {
+    pub async fn new(conf: Arc<Conf>, event_tx: Option<mpsc::UnboundedSender<AofEntry>>) -> Self {
         let aof_path = PathBuf::from(conf.aof.dir.clone());
         let aof = AofWriter::new(aof_path.clone());
+
         let mut db = DB {
             group_manager: Arc::new(RwLock::new(GroupManager::new())),
             kv_store: Arc::new(RwLock::new(KvStore::new(Some(conf.lru_size)))),
             list: Arc::new(RwLock::new(SegList::new().await)),
             aof,
             aof_path,
+            event_tx,
         };
 
         db.load_and_apply().await.expect("failed to load aof");
@@ -87,56 +90,57 @@ impl DB {
         for entry in entries {
             match entry {
                 AofEntry::KvSet { db, key, val, ttl } => {
-                    self.kv_store.write().await.set(&db, key, val, ttl);
+                    let _ = self.kv_store.write().await.set(&db, key, val, ttl);
                 }
                 AofEntry::KvDel { db, key } => {
-                    self.kv_store.write().await.del(&db, &key);
+                    let _ = self.kv_store.write().await.del(&db, &key);
                 }
                 AofEntry::KvFlush { db } => {
-                    self.kv_store.write().await.flush(&db);
+                    let _ = self.kv_store.write().await.flush(&db);
                 }
                 AofEntry::LogCreateGroup { name } => {
-                    self.group_manager.write().await.create_group(&name);
+                    let _ = self.group_manager.write().await.create_group(&name);
                 }
                 AofEntry::LogDropGroup { name } => {
-                    self.group_manager.write().await.drop_group(&name);
+                    let _ = self.group_manager.write().await.drop_group(&name);
                 }
                 AofEntry::LogAdd {
                     group,
                     timestamp,
                     payload,
                 } => {
-                    self.group_manager
-                        .write()
-                        .await
-                        .add(&group, timestamp, payload.as_slice());
+                    let _ =
+                        self.group_manager
+                            .write()
+                            .await
+                            .add(&group, timestamp, payload.as_slice());
                 }
                 AofEntry::LogAddRange { group, entries } => {
                     let owned: Vec<(u64, Vec<u8>)> = entries;
                     let refs: Vec<(u64, &[u8])> =
                         owned.iter().map(|(ts, d)| (*ts, d.as_slice())).collect();
-                    self.group_manager.write().await.add_range(&group, &refs);
+                    let _ = self.group_manager.write().await.add_range(&group, &refs);
                 }
                 AofEntry::LogRemove { group, up_to_id } => {
-                    self.group_manager.write().await.remove(&group, up_to_id);
+                    let _ = self.group_manager.write().await.remove(&group, up_to_id);
                 }
                 AofEntry::ListPush { key, payload } => {
-                    self.list.write().await.push(key, payload);
+                    let _ = self.list.write().await.push(key, payload);
                 }
                 AofEntry::ListPushRange { key, items } => {
-                    self.list.write().await.push_range(key, items);
+                    let _ = self.list.write().await.push_range(key, items);
                 }
                 AofEntry::ListPop { key } => {
-                    self.list.write().await.pop(key);
+                    let _ = self.list.write().await.pop(key);
                 }
                 AofEntry::ListPopRange { key, start, end } => {
-                    self.list.write().await.pop_range(key, start, end);
+                    let _ = self.list.write().await.pop_range(key, start, end);
                 }
                 AofEntry::ListPopCount { key, count } => {
-                    self.list.write().await.pop_count(key, count);
+                    let _ = self.list.write().await.pop_count(key, count);
                 }
                 AofEntry::ListFlush { key } => {
-                    self.list.write().await.flush(key);
+                    let _ = self.list.write().await.flush(key);
                 }
             }
         }
@@ -155,7 +159,13 @@ impl DB {
             .await
             .set(&db, key.clone(), val.clone(), ttl)
             .map_err(DBError::KVSetError)?;
-        self.aof.write(AofEntry::KvSet { db, key, val, ttl });
+        let entry = AofEntry::KvSet { db, key, val, ttl };
+        self.aof.write(entry.clone());
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(entry)
+                .map_err(|e| eprintln!("failed to send entry to tx: {}", e.to_string()));
+        }
         Ok(())
     }
 
@@ -173,7 +183,13 @@ impl DB {
             .await
             .del(&db, &key)
             .map_err(DBError::KVDelError)?;
-        self.aof.write(AofEntry::KvDel { db, key });
+        let entry = AofEntry::KvDel { db, key };
+        self.aof.write(entry.clone());
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(entry)
+                .map_err(|e| eprintln!("failed to send entry to tx: {}", e.to_string()));
+        }
         Ok(())
     }
 
@@ -191,7 +207,12 @@ impl DB {
             .await
             .flush(&db)
             .map_err(DBError::KVFlushError)?;
-        self.aof.write(AofEntry::KvFlush { db });
+        let entry = AofEntry::KvFlush { db };
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(entry)
+                .map_err(|e| eprintln!("failed to send entry to tx: {}", e.to_string()));
+        }
         Ok(())
     }
 

@@ -1,10 +1,15 @@
-use std::{collections::HashMap, ops::Deref, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    ops::Deref,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::anyhow;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, mpsc},
     time,
 };
 
@@ -29,16 +34,50 @@ pub struct HaManager {
     ha_conf: Arc<RwLock<HaConf>>,
     db: Arc<RwLock<DB>>,
     follower_timeout: Arc<Mutex<HashMap<String, u8>>>,
+    rx: mpsc::UnboundedReceiver<AofEntry>,
+    uncommitted_events: Vec<AofEntry>,
 }
 impl HaManager {
-    pub fn new(conf: Arc<Conf>, ha_conf: Arc<RwLock<HaConf>>, db: Arc<RwLock<DB>>) -> Self {
+    pub fn new(
+        conf: Arc<Conf>,
+        ha_conf: Arc<RwLock<HaConf>>,
+        db: Arc<RwLock<DB>>,
+        rx: mpsc::UnboundedReceiver<AofEntry>,
+    ) -> Self {
         return HaManager {
             conf,
             ha_conf,
             db,
             follower_timeout: Arc::new(Mutex::new(HashMap::new())),
+            rx,
+            uncommitted_events: Vec::new(),
         };
     }
+    pub async fn start(&mut self) -> anyhow::Result<()> {
+        let entry = match self.rx.try_recv() {
+            Ok(entry) => entry,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => self
+                .rx
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("aof event closed"))?,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                anyhow::bail!("aof event channel disconnected");
+            }
+        };
+        self.uncommitted_events.push(entry);
+        let replica_conf = self.conf.replica_conf.as_ref().unwrap();
+
+        if self.uncommitted_events.len() >= replica_conf.event_buffer_size.unwrap_or(100) {
+            let events_cp = self.uncommitted_events.clone();
+            self.uncommitted_events = Vec::new();
+            for follower in self.ha_conf.read().await.followers.clone() {
+                sync_follower(&follower, &events_cp).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn heartbeat_followers(&mut self) {
         let ha_conf = Arc::clone(&self.ha_conf);
         let follower_timeout = Arc::clone(&self.follower_timeout);

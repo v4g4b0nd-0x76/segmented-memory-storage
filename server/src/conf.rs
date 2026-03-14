@@ -18,6 +18,7 @@ pub struct ReplicaConf {
     pub role: Option<ReplicaRole>,
     pub followers: Option<Vec<String>>,
     pub master: Option<String>,
+    pub event_buffer_size: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -46,6 +47,7 @@ fn default_replica() -> Option<ReplicaConf> {
         role: None,
         followers: None,
         master: None,
+        event_buffer_size: None,
     })
 }
 fn default_aof() -> AofConf {
