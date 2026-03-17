@@ -27,7 +27,7 @@ impl DB {
 
         let mut db = DB {
             group_manager: Arc::new(RwLock::new(GroupManager::new())),
-            kv_store: Arc::new(RwLock::new(KvStore::new(Some(conf.lru_size)))),
+            kv_store: Arc::new(RwLock::new(KvStore::new())),
             list: Arc::new(RwLock::new(SegList::new().await)),
             aof,
             aof_path,
@@ -223,9 +223,15 @@ impl DB {
             .create_group(name)
             .await
             .map_err(DBError::LogCreateGroupError)?;
-        self.aof.write(AofEntry::LogCreateGroup {
+        let entry = AofEntry::LogCreateGroup {
             name: name.to_string(),
-        });
+        };
+        self.aof.write(entry.clone());
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(entry)
+                .map_err(|e| eprintln!("failed to send entry to tx: {}", e.to_string()));
+        }
         Ok(())
     }
 
@@ -236,9 +242,15 @@ impl DB {
             .drop_group(name)
             .await
             .map_err(DBError::LogDropGroupError)?;
-        self.aof.write(AofEntry::LogDropGroup {
+        let entry = AofEntry::LogDropGroup {
             name: name.to_string(),
-        });
+        };
+        self.aof.write(entry.clone());
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(entry)
+                .map_err(|e| eprintln!("failed to send entry to tx: {}", e.to_string()));
+        }
         Ok(())
     }
 
@@ -255,11 +267,17 @@ impl DB {
             .add(group, timestamp, payload)
             .await
             .map_err(DBError::LogAppendError)?;
-        self.aof.write(AofEntry::LogAdd {
+        let entry = AofEntry::LogAdd {
             group: group.to_string(),
             timestamp,
             payload: payload.to_vec(),
-        });
+        };
+        self.aof.write(entry.clone());
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(entry)
+                .map_err(|e| eprintln!("failed to send entry to tx: {}", e.to_string()));
+        }
         Ok(id)
     }
 
@@ -275,10 +293,16 @@ impl DB {
             .add_range(group, entries)
             .await
             .map_err(DBError::LogAppendRangeError)?;
-        self.aof.write(AofEntry::LogAddRange {
+        let entry = AofEntry::LogAddRange {
             group: group.to_string(),
             entries: entries.iter().map(|(ts, d)| (*ts, d.to_vec())).collect(),
-        });
+        };
+        self.aof.write(entry.clone());
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(entry)
+                .map_err(|e| eprintln!("failed to send entry to tx: {}", e.to_string()));
+        }
         Ok(result)
     }
 
@@ -312,10 +336,16 @@ impl DB {
             .remove(group, up_to_id)
             .await
             .map_err(DBError::LogRemoveError)?;
-        self.aof.write(AofEntry::LogRemove {
+        let entry = AofEntry::LogRemove {
             group: group.to_string(),
             up_to_id,
-        });
+        };
+        self.aof.write(entry.clone());
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(entry)
+                .map_err(|e| eprintln!("failed to send entry to tx: {}", e.to_string()));
+        }
         Ok(())
     }
 
@@ -339,7 +369,13 @@ impl DB {
             .push(key.clone(), payload.clone())
             .await
             .map_err(DBError::ListPushError)?;
-        self.aof.write(AofEntry::ListPush { key, payload });
+        let entry = AofEntry::ListPush { key, payload };
+        self.aof.write(entry.clone());
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(entry)
+                .map_err(|e| eprintln!("failed to send entry to tx: {}", e.to_string()));
+        }
         Ok(())
     }
 
@@ -354,7 +390,13 @@ impl DB {
             .push_range(key.clone(), items.clone())
             .await
             .map_err(DBError::ListPushRangeError)?;
-        self.aof.write(AofEntry::ListPushRange { key, items });
+        let entry = AofEntry::ListPushRange { key, items };
+        self.aof.write(entry.clone());
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(entry)
+                .map_err(|e| eprintln!("failed to send entry to tx: {}", e.to_string()));
+        }
         Ok(())
     }
 
@@ -366,7 +408,13 @@ impl DB {
             .pop(key.clone())
             .await
             .map_err(DBError::ListPopError)?;
-        self.aof.write(AofEntry::ListPop { key });
+        let entry = AofEntry::ListPop { key };
+        self.aof.write(entry.clone());
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(entry)
+                .map_err(|e| eprintln!("failed to send entry to tx: {}", e.to_string()));
+        }
         Ok(data)
     }
 
@@ -383,7 +431,13 @@ impl DB {
             .pop_range(key.clone(), start, end)
             .await
             .map_err(DBError::ListPopRangeError)?;
-        self.aof.write(AofEntry::ListPopRange { key, start, end });
+        let entry = AofEntry::ListPopRange { key, start, end };
+        self.aof.write(entry.clone());
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(entry)
+                .map_err(|e| eprintln!("failed to send entry to tx: {}", e.to_string()));
+        }
         Ok(data)
     }
 
@@ -399,7 +453,13 @@ impl DB {
             .pop_count(key.clone(), count)
             .await
             .map_err(DBError::ListPopCountError)?;
-        self.aof.write(AofEntry::ListPopCount { key, count });
+        let entry = AofEntry::ListPopCount { key, count };
+        self.aof.write(entry.clone());
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(entry)
+                .map_err(|e| eprintln!("failed to send entry to tx: {}", e.to_string()));
+        }
         Ok(data)
     }
 
@@ -419,7 +479,13 @@ impl DB {
             .flush(key.clone())
             .await
             .map_err(DBError::ListFlushError)?;
-        self.aof.write(AofEntry::ListFlush { key });
+        let entry = AofEntry::ListFlush { key };
+        self.aof.write(entry.clone());
+        if let Some(tx) = &self.event_tx {
+            let _ = tx
+                .send(entry)
+                .map_err(|e| eprintln!("failed to send entry to tx: {}", e.to_string()));
+        }
         Ok(())
     }
 }
@@ -494,7 +560,7 @@ pub enum DBError {
     LogReadError(GroupError),
     LogReadRangeError(GroupError),
     LogRemoveError(GroupError),
-    LogListGroupsError(GroupError),
+
     LogGroupStatsError(GroupError),
     KVSetError(anyhow::Error),
     KVGetError(anyhow::Error),
@@ -520,7 +586,6 @@ impl std::fmt::Display for DBError {
             DBError::LogReadError(e) => write!(f, "failed to read from log: {}", e),
             DBError::LogReadRangeError(e) => write!(f, "failed to read range from log: {}", e),
             DBError::LogRemoveError(e) => write!(f, "failed to remove from log: {}", e),
-            DBError::LogListGroupsError(e) => write!(f, "failed to list groups: {}", e),
             DBError::LogGroupStatsError(e) => write!(f, "failed to read group stats: {}", e),
             DBError::KVSetError(e) => write!(f, "failed to set key: {}", e),
             DBError::KVGetError(e) => write!(f, "failed to get key: {}", e),

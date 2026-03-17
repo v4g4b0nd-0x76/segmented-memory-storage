@@ -31,7 +31,7 @@ async fn main() {
         let master = replica_conf.master.as_deref().unwrap();
         let ha_manager_clone = Arc::clone(&ha_manager);
         tokio::spawn(async move {
-            ha_manager_clone.write().await.start().await;
+            let _ = ha_manager_clone.write().await.start().await;
         });
         match &replica_conf.role {
             Some(ReplicaRole::Leader) => ha_manager.write().await.heartbeat_followers().await,

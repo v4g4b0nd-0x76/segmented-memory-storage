@@ -44,7 +44,6 @@ impl Server {
         let ln = TcpListener::bind(addr).await?;
         loop {
             let (socket, peer) = ln.accept().await?;
-            println!("New connection from {}", peer);
             socket.set_nodelay(true)?;
             let server = Arc::new(Server {
                 conf: Arc::clone(&self.conf),

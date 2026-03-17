@@ -1,14 +1,14 @@
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
 use anyhow::{Ok, anyhow};
 use serde::{Deserialize, Serialize};
-
-use crate::db::lru::LRU;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DBEntry {
     pub val: Vec<u8>,
     pub ttl: i64,
+    pub used_count: u64,
+    pub last_used: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +38,10 @@ impl DB {
             self.entries.remove(key);
             return None;
         }
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.used_count += 1;
+            entry.last_used = chrono::Utc::now().timestamp_millis();
+        }
         self.entries.get(key).cloned()
     }
 
@@ -55,29 +59,36 @@ impl DB {
     fn flush(&mut self) {
         self.entries.clear();
     }
+    fn expire_least_used(&mut self) {
+        let sample_size = (self.entries.len() / 5).max(16).min(self.entries.len());
+        if sample_size == 0 {
+            return;
+        }
+
+        let mut candidates: Vec<(String, u64, i64)> = self
+            .entries
+            .iter()
+            .take(sample_size)
+            .map(|(k, v)| (k.clone(), v.used_count, v.last_used))
+            .collect();
+
+        candidates.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+
+        let remove_count = (sample_size / 4).max(1);
+        for (key, _, _) in candidates.iter().take(remove_count) {
+            self.entries.remove(key);
+        }
+    }
 }
 
 pub struct KvStore {
     dbs: HashMap<String, DB>,
-    lru: LRU<String, DBEntry>,
-    lru_size: usize,
 }
 
 impl KvStore {
-    fn cache_key(db: &str, key: &str) -> String {
-        let mut s = String::with_capacity(db.len() + 1 + key.len());
-        s.push_str(db);
-        s.push(':');
-        s.push_str(key);
-        s
-    }
-
-    pub fn new(lru_size: Option<usize>) -> Self {
-        let lru_size = lru_size.unwrap_or(100_000);
+    pub fn new() -> Self {
         KvStore {
             dbs: HashMap::new(),
-            lru: LRU::new(lru_size, Duration::from_secs(60)),
-            lru_size,
         }
     }
 
@@ -87,37 +98,35 @@ impl KvStore {
             .or_insert_with(|| DB::new(db))
     }
 
-    fn get_db(&self, db: &str) -> anyhow::Result<&DB> {
-        self.dbs
-            .get(db)
-            .ok_or_else(|| anyhow!("invalid database: {}", db))
-    }
-
     pub fn set(&mut self, db: &str, key: String, val: Vec<u8>, ttl: i64) -> anyhow::Result<()> {
         let ttl_ts = if ttl == 0 {
             0
         } else {
             chrono::Utc::now().timestamp_millis() + ttl
         };
-        self.lru.remove(&Self::cache_key(db, &key));
-        self.get_db_mut(db).set(key, DBEntry { val, ttl: ttl_ts });
+
+        let db = self.get_db_mut(db);
+        if db.entries.len() >= 1024 {
+            let _ = db.expire_least_used();
+        }
+        db.set(
+            key,
+            DBEntry {
+                val,
+                ttl: ttl_ts,
+                used_count: 0,
+                last_used: chrono::Utc::now().timestamp_millis(),
+            },
+        );
         Ok(())
     }
 
     pub fn get(&mut self, db: &str, key: String) -> anyhow::Result<Option<DBEntry>> {
-        let ck = Self::cache_key(db, &key);
-        if let Some(entry) = self.lru.get(&ck) {
-            return Ok(Some(entry.clone()));
-        }
         let result = self.get_db_mut(db).get(&key);
-        if let Some(ref entry) = result {
-            self.lru.insert(ck, entry.clone());
-        }
         Ok(result)
     }
 
     pub fn del(&mut self, db: &str, key: &str) -> anyhow::Result<()> {
-        self.lru.remove(&Self::cache_key(db, key));
         self.get_db_mut(db).del(key)
     }
 
@@ -130,7 +139,7 @@ impl KvStore {
 
     pub fn flush(&mut self, db: &str) -> anyhow::Result<()> {
         self.get_db_mut(db).flush();
-        self.lru = LRU::new(self.lru_size, Duration::from_secs(60));
+
         Ok(())
     }
 
@@ -149,7 +158,7 @@ mod tests {
 
     #[test]
     fn test_full_cycle() {
-        let mut store = KvStore::new(None);
+        let mut store = KvStore::new();
 
         store
             .set("db", "k1".to_string(), b"hello".to_vec(), 0)
@@ -173,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_ttl_expiry() {
-        let mut store = KvStore::new(None);
+        let mut store = KvStore::new();
         store.set("db", "k1".to_string(), b"v".to_vec(), 1).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
         assert!(store.get("db", "k1".to_string()).unwrap().is_none());
@@ -181,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_create_db_duplicate() {
-        let mut store = KvStore::new(None);
+        let mut store = KvStore::new();
         store.create_db("mydb").unwrap();
         assert!(store.create_db("mydb").is_err());
     }
@@ -198,7 +207,7 @@ mod bench {
         let unique_keys: usize = 2_000_000;
         let db = "bench_db";
 
-        let mut store = KvStore::new(Some(unique_keys));
+        let mut store = KvStore::new();
 
         println!(
             "\n[BENCH] Writing {} entries ({} unique keys)...",
