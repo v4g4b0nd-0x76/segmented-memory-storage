@@ -1,30 +1,45 @@
-# Segmented Memory Storage
+# mem-stream
+
+> **Heads up:** this project is a learning exercise for getting comfortable with Rust — not meant for production use.
+
+A toy in-memory database written in Rust with a custom TCP server, three different storage primitives, and a lightweight client that wraps everything behind an HTTP API.
+
+---
 
 ## Server
 
-Separate memory in fixed size segments and add new segments when current ones is full
-by DMA we increase the performance of writing O(1) by copy data in non overlapping manner into segment pointers and for reading by keeping a BtreeMap of segment indexes we achieve O(log N);
+The core of the project. Everything lives in memory; there's no persistence by default beyond the AOF log described below.
 
-We can have many groups that each would have this segments and write to groups;
+### Segmented log (`SegLog`)
 
-Custom tcp frame encoder and decoder with custom fixed sized entries for commands(similar to REPL in redis);
+The storage engine allocates memory in fixed-size 64 KB segments aligned to page boundaries. New segments are added on demand rather than growing a single contiguous buffer, which keeps writes non-overlapping (think DMA-style copies via `ptr::copy_nonoverlapping`). Append is O(1) and reads are O(log N) thanks to a `BTreeMap` index of entry IDs. Groups let you namespace multiple independent logs.
 
-Tokio simple Tcp connection for p2p communication;
+### Key-value store (`KV`)
 
-LRU in group wrapper level for better performance and less segment access.
+A straightforward string-keyed store with optional TTL per entry. It works a bit like Redis in that you can have multiple isolated databases by name. Reads go through an LRU cache, which helps a lot on read-heavy workloads — though the tradeoff is that replaying the AOF on restart is slower.
 
-Key Value (KV) storage with ttl option and different database isolated access like redis.
-KV wrapper has LRU which improves read time in heavy read workload(the write time - reload AOF is downside)
+### Segmented list (`SegList`)
 
-Seg List which is like redis stack to push, push_range, pop, pop_count, pop_range and flush features
+A stack-like structure with `push`, `push_range`, `pop`, `pop_count`, `pop_range`, and `flush`. Backed by the same segmented memory layout as the log.
 
-there is a wrapper around all data sets that has an aof and apply commands done in that aof in order to recreate data
-the aof file can be used as change log for replica follower catchups
+### Protocol & TCP server
 
-Pipeline: A concurrent command batching system that groups DB operations (KV, List, Log) into atomic jobs, queues them by operation count (shorter jobs run first), and uses a resource-based lock manager to safely execute non-conflicting pipelines in parallel.
+Rather than using an off-the-shelf protocol, the server speaks its own binary format over TCP. Each frame is length-prefixed (4-byte LE header) and the commands are encoded as fixed-size byte sequences with a single opcode byte — roughly similar to how Redis' RESP works but at a lower level. Tokio drives the async networking side.
+
+### AOF (append-only file)
+
+Every write is serialized as a JSON entry and appended to a log file. On startup the DB replays this log to rebuild state. The same AOF stream is also used for replication — followers can catch up by consuming entries from the leader's log.
+
+### Pipeline
+
+There's a basic batching layer that lets you group multiple KV, list, or log operations into a single atomic job. Jobs are queued by command count (smaller batches go first) and a resource-based lock manager allows non-conflicting pipelines to run in parallel.
+
+### High availability
+
+A basic leader/follower setup using the same TCP protocol. Followers register with the leader and receive AOF entries as they come in. Heartbeats are used to detect dead followers.
+
+---
 
 ## Client
 
-Custom connection pool for connections to server using its own protocol
-
-Http endpoints for easier access to server with no need to handle custom registries.
+The client side has two pieces: a connection pool that manages raw TCP connections to the server using the same binary protocol, and an HTTP layer (built on top) that exposes the same operations as plain REST endpoints. The HTTP API makes it easier to poke at the server without writing custom protocol handling.

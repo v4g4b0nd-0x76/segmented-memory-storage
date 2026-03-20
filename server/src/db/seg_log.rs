@@ -2,10 +2,7 @@ use std::{
     alloc::{Layout, alloc_zeroed, dealloc},
     collections::BTreeMap,
     ptr,
-    sync::Arc,
 };
-
-use tokio::sync::Mutex;
 
 const SEGMENT_SIZE: usize = 64 * 1024;
 const SEGMENT_ALIGN: usize = 4096;
@@ -49,6 +46,7 @@ impl SegLog {
         let mut segs: Vec<*mut u8> = Vec::with_capacity(MAX_SEGMENTS);
         for _ in 0..INITIAL_SEGMENTS {
             let ptr = unsafe { alloc_zeroed(seg_layout) };
+
             if ptr.is_null() {
                 panic!("failed to allocate segment");
             }
