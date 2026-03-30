@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use ahash::AHashMap;
 use anyhow::{Ok, anyhow};
 use serde::{Deserialize, Serialize};
 
@@ -14,14 +15,14 @@ pub struct DBEntry {
 #[derive(Clone, Debug)]
 struct DB {
     id: String,
-    entries: HashMap<String, DBEntry>,
+    entries: AHashMap<String, DBEntry>,
 }
 
 impl DB {
     fn new(id: &str) -> Self {
         DB {
             id: id.to_string(),
-            entries: HashMap::with_capacity(1024),
+            entries: AHashMap::with_capacity(1024),
         }
     }
 
